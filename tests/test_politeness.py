@@ -13,9 +13,11 @@ Run:  .venv/bin/python -m pytest -q      # from the repository root
 
 from __future__ import annotations
 
+import os
 import random
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from urllib.robotparser import RobotFileParser
@@ -23,10 +25,15 @@ from urllib.robotparser import RobotFileParser
 import httpx
 import pytest
 
+from js_ts_mcp import politeness as pol_mod
 from js_ts_mcp.politeness import (
+    CACHE_DIR_ENV_VAR,
+    FALLBACK_CACHE_DIR_NAME,
     Politeness,
     PoliteResponse,
+    ROBOTS_DB_NAME,
     _match_rules,
+    default_robots_db_path,
     parse_robots,
 )
 
@@ -1196,3 +1203,247 @@ def test_wall_clock_jump_does_not_disturb_the_throttle():
     assert pol.stats()["throttle_waits"] == 3
     assert pol.stats()["throttle_sleep_s"] == pytest.approx(1.5)
     assert pol.stats()["robots_requests"] == 1   # robots stayed fresh the whole time
+
+
+# --------------------------------------------------------------------------- #
+# 10. P6 — the robots store degrades, the call survives
+# --------------------------------------------------------------------------- #
+#: The exact error SQLite raises when the file exists but the filesystem (or the
+#: file's own permission bits) refuses the write.  Measured live on this host:
+#: ``~/.cache/<repo>`` is a read-only mount, so every robots-cache write raised
+#: it and the tool answered ``error="politeness failure: …"``.
+READONLY = "attempt to write a readonly database"
+
+#: root bypasses the permission bits, so the chmod-based tests below only mean
+#: something for an unprivileged user (same guard as tests/test_cache.py).
+NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+
+
+class ReadOnlyDb:
+    """A store that reads fine and refuses every write, like a read-only mount.
+
+    ``execute``/``commit`` raise the production error instead of touching disk,
+    so the failure is reproduced without needing a read-only filesystem.
+    """
+
+    def __init__(self, rows: dict[str, tuple[int, str, float]] | None = None) -> None:
+        self.rows = dict(rows or {})
+        self.writes = 0
+
+    def execute(self, sql: str, params=()):
+        if sql.lstrip().upper().startswith("SELECT"):
+            return _Row(self.rows.get(params[0]) if params else None)
+        self.writes += 1
+        raise sqlite3.OperationalError(READONLY)
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError(READONLY)
+
+    def close(self) -> None:
+        pass
+
+
+class _Row:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+def test_readonly_database_never_fails_a_request(monkeypatch, tmp_path):
+    """The measured production bug, reproduced offline.
+
+    Pre-P6 the refused INSERT escaped :meth:`Politeness._store_robots_row` →
+    ``_robots_for`` → ``_get`` → ``get()`` as
+    ``error="politeness failure: attempt to write a readonly database"``, which
+    ``fetchers._get`` turned into a ``FetchError`` and the tool into a null
+    README — on a host whose network was perfectly reachable.
+    """
+    clock = FakeClock()
+    pol, client, rec = make(
+        clock, {"/robots.txt": PYPI_ROBOTS, "/project/dio/": b"ok"},
+        cache_path=str(tmp_path / "robots.db"),
+    )
+    monkeypatch.setattr(pol, "_db", ReadOnlyDb())
+
+    resp = pol.get(client, "https://pypi.org/project/dio/")
+
+    assert resp.ok is True, resp.error
+    assert resp.error is None
+    assert rec.hits("/project/dio/") == 1          # the request really happened
+    assert rec.robots_hits() == 1                  # and so did the robots fetch
+    assert pol.stats()["errors"] == 0              # nothing was reported as an error
+    assert pol.stats()["robots_write_failures"] == 1
+    assert pol.read_only is True                   # and it will not be retried
+    assert READONLY in (pol.read_only_reason or "")
+    pol.close()
+
+
+def test_refused_write_is_recorded_once_and_the_store_stops_trying(monkeypatch, tmp_path):
+    """Best-effort means *best-effort*: one counted failure, then no more writes."""
+    clock = FakeClock()
+    pol, client, rec = make(
+        clock, {"/robots.txt": PYPI_ROBOTS, "/a": b"a", "/b": b"b", "/c": b"c"},
+        cache_path=str(tmp_path / "robots.db"),
+    )
+    broken = ReadOnlyDb()
+    monkeypatch.setattr(pol, "_db", broken)
+
+    for path in ("/a", "/b", "/c"):
+        assert pol.get(client, f"https://pypi.org{path}").ok is True
+
+    assert broken.writes == 1, "the store was still being written to after the refusal"
+    assert pol.stats()["robots_write_failures"] == 1
+    assert pol.stats()["errors"] == 0
+    assert rec.robots_hits() == 3                  # every call still got its rules
+    pol.close()
+
+
+@NOT_ROOT
+def test_unwritable_cache_dir_falls_back_and_says_so(tmp_path, monkeypatch, capsys):
+    """The cache-dir env var is honoured first, and moved only when unwritable."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "robots.db").write_bytes(b"-- a database this process may not touch")
+    os.chmod(locked, 0o555)
+    fallback = tmp_path / "fallback"
+    monkeypatch.setenv(CACHE_DIR_ENV_VAR, str(locked))
+    monkeypatch.setattr(pol_mod, "_fallback_cache_dirs", lambda: (str(fallback), str(tmp_path / "temp")))
+
+    chosen = default_robots_db_path()
+
+    assert chosen == str(fallback / ROBOTS_DB_NAME)
+    assert os.access(os.path.dirname(chosen), os.W_OK)
+    err = capsys.readouterr().err
+    assert "robots cache fallback" in err
+    assert str(locked) in err
+    assert os.path.dirname(chosen) in err
+
+    # …and the layer built on that path works.
+    clock = FakeClock()
+    pol, client, rec = make(clock, {"/robots.txt": PYPI_ROBOTS, "/project/dio/": b"ok"},
+                            cache_path=chosen)
+    assert pol.get(client, "https://pypi.org/project/dio/").ok is True
+    assert rec.hits("/project/dio/") == 1
+    assert pol.stats()["robots_write_failures"] == 0
+    pol.close()
+
+
+@NOT_ROOT
+def test_no_writable_cache_dir_anywhere_still_polite(tmp_path, monkeypatch):
+    """No file at all is a supported state, not a failure."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0o555)
+    monkeypatch.setenv(CACHE_DIR_ENV_VAR, str(locked))
+    monkeypatch.setattr(
+        pol_mod, "_fallback_cache_dirs",
+        lambda: (str(locked / "nested"), str(locked / "temp")),
+    )
+
+    clock = FakeClock()
+    pol, client, rec = make(
+        clock, {"/robots.txt": PYPI_ROBOTS, "/project/dio/": b"ok"},
+        cache_path=default_robots_db_path(),
+    )
+    assert pol.in_memory is True
+    assert pol.cache_path is None
+    assert pol.read_only is True
+    assert pol.read_only_reason and "no fallback dir is writable" in pol.read_only_reason
+
+    resp = pol.get(client, "https://pypi.org/project/dio/")
+    assert resp.ok is True, resp.error
+    assert rec.hits("/project/dio/") == 1
+    assert pol.stats()["errors"] == 0
+    pol.close()
+
+
+@NOT_ROOT
+def test_readonly_store_still_serves_cached_rules(tmp_path):
+    """A warm ``robots.db`` that cannot be written is a read-only store, not a miss.
+
+    This is what a read-only mount leaves behind: the rows are readable, the
+    journal is not creatable.  Reading them must keep working — that is what
+    ``mode=ro`` is for.
+    """
+    db = str(tmp_path / "robots.db")
+    clock = FakeClock()
+    pol1, client1, rec1 = make(
+        clock, {"/robots.txt": PYPI_ROBOTS, "/project/dio/": b"ok"}, cache_path=db)
+    assert pol1.can_fetch("https://pypi.org/project/dio/", client=client1) is True
+    assert rec1.robots_hits() == 1
+    pol1.close()
+
+    os.chmod(db, 0o444)
+    pol2, client2, rec2 = make(
+        clock, {"/robots.txt": PYPI_ROBOTS, "/project/dio/": b"ok"}, cache_path=db)
+    assert pol2.read_only is True
+    assert pol2.cache_path == db                    # the file is still the store
+    assert pol2.in_memory is False
+    # Disallowed by the cached rules, answered from SQLite without a robots fetch.
+    assert pol2.can_fetch("https://pypi.org/pypi/dio/json", client=client2) is False
+    assert rec2.robots_hits() == 0
+    assert pol2.stats()["robots_cache_hits"] == 1
+    assert pol2.stats()["robots_write_failures"] == 0
+    pol2.close()
+    os.chmod(db, 0o644)
+
+
+@NOT_ROOT
+def test_readonly_store_without_a_table_degrades_to_memory(tmp_path, capsys):
+    """A read-only WAL database can open with **no** ``robots`` table at all.
+
+    Measured: a WAL database copied without its ``-wal``/``-shm`` sidecars opens
+    ``mode=ro`` and reports ``no such table: robots`` — the schema lived in the
+    WAL.  That is a miss, not an error, and the store moves to memory so the same
+    failure is not paid for on every call.
+    """
+    db = str(tmp_path / "robots.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE other (x INTEGER)")   # deliberately not "robots"
+    conn.commit()
+    conn.close()
+    os.chmod(db, 0o444)
+
+    clock = FakeClock()
+    pol, client, rec = make(
+        clock, {"/robots.txt": PYPI_ROBOTS, "/project/dio/": b"ok"}, cache_path=db)
+    resp = pol.get(client, "https://pypi.org/project/dio/")
+
+    assert resp.ok is True, resp.error
+    assert rec.hits("/project/dio/") == 1
+    assert rec.robots_hits() == 1                     # fetched, not read from the file
+    assert pol.stats()["robots_store_errors"] == 1
+    assert pol.stats()["errors"] == 0
+    assert pol.in_memory is True                      # moved off the unusable file
+    assert "store moved to memory" in capsys.readouterr().err
+    pol.close()
+
+
+def test_fallback_chain_is_the_repo_cache_dir_then_the_temp_dir():
+    """Where the fallback goes is part of the contract, so it is asserted here."""
+    repo_dir, temp_dir = pol_mod._fallback_cache_dirs()
+    package_dir = os.path.dirname(os.path.abspath(pol_mod.__file__))
+    repo_root = os.path.dirname(os.path.dirname(package_dir))
+    assert repo_dir == os.path.join(repo_root, FALLBACK_CACHE_DIR_NAME)
+    assert temp_dir == os.path.join(tempfile.gettempdir(), os.path.basename(repo_root))
+
+
+def test_stats_say_where_the_store_is(tmp_path):
+    """``stats()`` reports the store's state, so a degraded cache is visible."""
+    clock = FakeClock()
+    memory, _client, _rec = make(clock, {})
+    stats = memory.stats()
+    assert stats["robots_db"] is None
+    assert stats["read_only"] is False
+    assert stats["read_only_reason"] is None
+    assert stats["robots_write_failures"] == 0
+    assert stats["robots_store_errors"] == 0
+    memory.close()
+
+    db = str(tmp_path / "robots.db")
+    on_disk, _c2, _r2 = make(clock, {}, cache_path=db)
+    assert on_disk.stats()["robots_db"] == db
+    assert on_disk.stats()["read_only"] is False
+    on_disk.close()

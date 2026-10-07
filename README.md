@@ -15,7 +15,7 @@ An [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server that g
 |---|---|
 | `js_docs` | Resolve one identifier (`mdn:…`, `ts:…`, or a plain name like `Promise`) to a single docs page as markdown. |
 | `js_search` | Ranked multi-token search over the local index of 14,825 MDN + TypeScript entries (name **and** path). |
-| `npm_package` | npm package metadata + README: resolved version, description, license, homepage, repository URL, keywords, engines, dependencies. |
+| `npm_package` | npm package metadata + README: resolved version, description, license, homepage, repository URL, keywords, engines, dependencies. npm no longer ships a usable README in the packument, so the document is fetched from the package's GitHub repository. |
 | `js_status` | Real health check: index size/age, cache stats, live probes of all three hosts, and politeness counters. |
 | `health_check` | Server liveness and version. |
 
@@ -237,47 +237,44 @@ An ambiguous name returns every candidate and lets you pick — this is why the 
 
 `js_search` costs **zero** requests while the cached index is fresh (measured warm: 0 requests, 0 budget units). If the index is stale the call rebuilds it inside the same budget — measured cold: **4** units.
 
-### `npm_package(name, version=None)`
+### `npm_package(name, version=None, max_tokens=6000)`
 
-npm metadata + README. `name` is the package name; `version` pins one release. Returns `{"ok", "name", "version" (resolved), "description", "license", "homepage", "repository_url", "keywords", "engines", "dependencies", "readme_markdown", "url"}`. Cached 1 day, keyed by name + version.
+npm metadata + README. `name` is the package name; `version` pins one release; `max_tokens` caps the README. Returns `{"ok", "name", "version" (resolved), "description", "license", "homepage", "repository_url", "keywords", "engines", "dependencies", "readme_markdown", "url"}` plus `readme_source` when the README came from GitHub. Cached 1 day, keyed by name + version — the cache holds the **uncapped** README, so a later call with a bigger `max_tokens` gets more text without a new request.
+
+**Where the README comes from.** npm used to embed the README in the packument; for modern packages the `readme` field is there but **empty** (`zod`: 4 166 672 B packument, `readme` length 0; `express`: 808 998 B, length 0), and a single-version doc (`/zod/4.6.5`) has no `readme` key at all. So the document is fetched from the package's GitHub repository instead: `https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{candidate}`, candidates `README.md`, `Readme.md`, `readme.md`, `README.markdown`, `README.rst`, `docs/README.md`, first 200 whose body is over 80 bytes wins. A candidate that is a short single line naming another markdown/rst file is a **pointer** and is followed (max 2 hops) — that is how a monorepo works:
 
 ```jsonc
-// npm_package({ "name": "left-pad" })
+// npm_package({ "name": "zod" })   — live output, 2026-10-07
 {
   "ok": true,
-  "name": "left-pad",
-  "version": "1.3.0",
-  "description": "String left pad",
-  "license": "WTFPL",
-  "homepage": "https://github.com/stevemao/left-pad#readme",
-  "repository_url": "git+ssh://git@github.com/stevemao/left-pad.git",
-  "keywords": ["leftpad", "left", "pad", "padding", "string", "repeat"],
+  "name": "zod",
+  "version": "4.6.5",
+  "description": "TypeScript-first schema declaration and validation library with static type inference",
+  "license": "MIT",
+  "homepage": "https://zod.dev",
+  "repository_url": "git+https://github.com/colinhacks/zod.git",
+  "keywords": ["typescript", "schema", "validation", "type", "inference"],
   "engines": null,
   "dependencies": {},
-  "readme_markdown": "## left-pad\n\nString left pad\n…\n```js\nconst leftPad = require('left-pad')\n\nleftPad('foo', 5)\n// => \"  foo\"\n``` …",
-  "url": "https://www.npmjs.com/package/left-pad",
-  "cached": false
+  "readme_markdown": "<p align=\"center\">\n  <img src=\"logo.svg\" width=\"200px\" …",
+  "url": "https://www.npmjs.com/package/zod",
+  "readme_source": "github:colinhacks/zod@HEAD/packages/zod/README.md",
+  "cached": false,
+  "truncated": false
 }
 ```
 
-A pinned version resolves to exactly that release. Note that the registry does not always carry a README for a non-latest release — `readme_markdown` is then `null` rather than a guess:
+`colinhacks/zod/HEAD/README.md` is 22 bytes and says exactly `packages/zod/README.md`; following it yields the real 7 304-byte document. `expressjs/express` has no `README.md` at all but a capitalised `Readme.md` (10 371 B), which the candidate list finds. A `.rst` README is returned **raw** with a `note` saying so — this server has no RST→markdown converter.
+
+When there is no README to be had, `readme_markdown` is `null` **and `note` says why** — a silent null is the bug:
 
 ```jsonc
-// npm_package({ "name": "typescript", "version": "5.6.3" })
-{
-  "ok": true,
-  "name": "typescript",
-  "version": "5.6.3",
-  "description": "TypeScript is a language for application scale JavaScript development",
-  "license": "Apache-2.0",
-  "homepage": "https://www.typescriptlang.org/",
-  "repository_url": "git+https://github.com/microsoft/TypeScript.git",
-  "engines": { "node": ">=14.17" },
-  "readme_markdown": null,
-  "url": "https://www.npmjs.com/package/typescript/5.6.3",
-  "…": "…"
-}
+// a package whose repository is not on GitHub
+"readme_markdown": null,
+"note": "npm serves no readme for this package and its repository (https://gitlab.com/acme/thing.git) is not a GitHub project URL"
 ```
+
+Only `github.com` repository URLs are followed (`git+https://`, `https://`, `git://`, `git+ssh://`, `ssh://`, and the `github:owner/repo` shorthand npm also serves). GitLab, Bitbucket and missing repository URLs get the note, not a guess. A spent request budget costs the README, never the lookup: the result stays `ok: true` with `note` naming the budget.
 
 An unknown name is an error dict:
 
@@ -360,10 +357,11 @@ How the test suite pins this (`tests/test_politeness_wiring.py`, all four run of
 | `test_npm_request_proceeds_despite_the_trap` | end-to-end through `fetch_npm_package`: `ok is True`, `blocked_by_robots == 0`, and the robots file was fetched exactly once |
 | `test_trap_is_cached_so_robots_is_fetched_once_per_ttl` | the trap body is stored like any other robots record, so the registry costs one robots request per 7 days, not one per call |
 
-### Two more robots facts, both negatively cached
+### Three more robots facts, all negatively cached
 
 - **`https://www.npmjs.com/robots.txt` is a Cloudflare 403.** That host is deliberately **not** in the allowlist: this server only *reports* `www.npmjs.com` URLs (the `url` field of `npm_package`), it never requests them. With the production allowlist the layer refuses such a request outright and makes **no** network call at all — measured live, `layer.get("https://www.npmjs.com/robots.txt")` returns `error='host www.npmjs.com is not in ALLOWED_HOSTS'` with zero bytes on the wire. The 403 itself is still negatively cached by the layer (one robots request per host per 7 days, not one per call), which is asserted offline by `test_www_npmjs_com_403_robots_is_negatively_cached` and `test_www_npmjs_com_is_not_in_the_allowlist`.
 - **`https://www.typescriptlang.org/robots.txt` is a 404** (GitHub Pages serves an HTML 404 page, measured 9,379 bytes). Also negatively cached: `robots_negative: 1` in `js_status().politeness` on a cold run, and one robots request per week thereafter — asserted by `test_typescriptlang_robots_404_is_negatively_cached`.
+- **`https://raw.githubusercontent.com/robots.txt` is a 404 too** — measured 2026-10-07, HTTP 404 with the 14-byte body `404: Not Found`. GitHub serves raw files without publishing robots rules, so the README fallback has **no** rules to obey there and the host is allowlisted explicitly instead. That is also why it must be in `ALLOWED_HOSTS`: an unlisted host is refused by the layer, and a missing entry would turn the fallback into a silent no-op. Asserted by `test_raw_host_robots_404_is_negatively_cached` and `test_allowlist_covers_exactly_the_four_fetched_hosts`.
 
 MDN's `robots.txt` is the only one of the three that publishes real rules — 119 bytes, one `User-agent: *` group, three `Disallow` lines: `/api/`, `/*/files/` and `/media`. `/api/` matters here: this server used to call `developer.mozilla.org/api/v1/docs`, which is both dead and disallowed. The layer refuses it with **no request made** — verified live: `can_fetch("https://developer.mozilla.org/api/v1/docs/Array")` → `False`, `can_fetch("https://developer.mozilla.org/en-US/files/x")` → `False`, while the docs paths this server actually uses return `True`.
 
@@ -402,10 +400,10 @@ Every outbound request — `js_docs`, `js_search` (its index build), `npm_packag
 - **Per-host throttle, including `Crawl-delay`.** Sequential requests to one host are spaced 0.35–0.9 s by default, or by the site's own `Crawl-delay` when it declares one — **none of the three hosts declares a `Crawl-delay` today** (checked against all three live robots responses), so the default window applies. The `robots.txt` fetch queues in the same per-host line as a page request, and a `Crawl-delay` learned *from* a robots fetch gates the request that triggered the fetch, not only the next one. Measured cold `js_docs("Promise")`: `throttle_sleep_s: 1.382` across 2 waits.
 - **`429` / `503` / `504` are handled.** `Retry-After` is honoured to the second; without it the per-host delay is escalated and the request retried **once**. A response that stalls past 10 s escalates the delay instead of being retried blindly.
 - **Conditional GET.** `ETag` / `Last-Modified` and the raw body are stored next to the cached entry, so refreshing an expired page costs a `304` instead of re-downloading it. Verified against live headers: **all three hosts send both** `ETag` and `Last-Modified` (MDN `"2f13939d…"`, typescriptlang.org `W/"6ac39afa-2fe88"`, the npm registry `W/"c7ff9479…"`). Measured live: a cold `js_docs("ts:intro")` after the index build had already fetched that same page revalidated it with one `304` and 0 bytes (`conditional: 1`, `revalidated_304: 1`). No conditional headers are ever sent to a host that sent no validators (`test_host_without_validators_never_sends_conditional_headers`).
-- **Request budgets — one unit is one request on the wire.** One tool call makes at most **7** requests; the robots.txt fetch of a cold host, a `429` retry, a transport retry and every redirect hop each pay a unit. Measured live with a cold cache: `js_docs("mdn:…Array")` = **2** (robots + page), `js_docs("Promise")` = **5** (MDN robots + sitemap + TypeScript robots + handbook page + the page itself — the index rebuild is what makes a plain name expensive), `js_docs("ts:intro")` = **2**, an unknown identifier = **4** (the index build, then the index answers), `js_search(…)` = **4** cold and **0** warm, `npm_package(…)` = **2**. `js_status` has its own cap of **12** (measured cold **8**, warm **3**) so its probes plus a stale-index rebuild always fit — a probe refused by the budget would report `error` and drag `overall` to `"degraded"` for a purely internal reason. The search-index build shares the tool call's budget; a build that hits its cap stops early and returns a **partial** index (`"partial": true`, `"partial_reason": …`) instead of raising, and a partial index is never cached.
+- **Request budgets — one unit is one request on the wire.** One tool call makes at most **7** requests; the robots.txt fetch of a cold host, a `429` retry, a transport retry and every redirect hop each pay a unit. Measured live with a cold cache: `js_docs("mdn:…Array")` = **2** (robots + page), `js_docs("Promise")` = **5** (MDN robots + sitemap + TypeScript robots + handbook page + the page itself — the index rebuild is what makes a plain name expensive), `js_docs("ts:intro")` = **2**, an unknown identifier = **4** (the index build, then the index answers), `js_search(…)` = **4** cold and **0** warm, `npm_package("zod")` = **5** cold (npm robots + packument + `raw.githubusercontent.com` robots + the 22-byte pointer README + the document it names) and **3** warm (both READMEs revalidated with `304`, robots cached). `js_status` has its own cap of **12** (measured cold **8**, warm **3**) so its probes plus a stale-index rebuild always fit — a probe refused by the budget would report `error` and drag `overall` to `"degraded"` for a purely internal reason. The search-index build shares the tool call's budget; a build that hits its cap stops early and returns a **partial** index (`"partial": true`, `"partial_reason": …`) instead of raising, and a partial index is never cached. A README search that runs out of budget stops early and reports a `note` — the package metadata is still returned.
 - **Redirects are resolved by the layer, not by httpx.** Requests go out with `follow_redirects=False`, every 3xx target is re-checked against that host's robots rules before its body is used, the chain is capped at 5 hops and reported as an error (never an exception), and the `url` a tool returns is the **final** URL of the chain.
 - **Body-size cap: 2 MiB.** Raw bodies are only kept for revalidation when they are under `MAX_CACHED_BODY_BYTES = 2 * 1024 * 1024`. [Why that number](#why-2-mib-for-the-body-cap).
-- **Host allowlist.** Only `developer.mozilla.org`, `www.typescriptlang.org` and `registry.npmjs.org` can be contacted, so a malformed identifier or an unexpected redirect cannot turn a docs lookup into a request somewhere else.
+- **Host allowlist.** Only `developer.mozilla.org`, `www.typescriptlang.org`, `registry.npmjs.org` and `raw.githubusercontent.com` can be contacted, so a malformed identifier, a package's repository URL or an unexpected redirect cannot turn a lookup into a request somewhere else. A non-GitHub `repository` URL is reported, never fetched.
 
 The layer never raises and never changes a tool's return shape; `js_status` reports its counters under the top-level `politeness` key.
 
@@ -470,6 +468,12 @@ python3 -m venv .venv
 **`readme_markdown` is `null` for a pinned version.** Normal: the registry does not always carry a README for a non-latest release. Drop the pin to read the latest README.
 
 **A `www.npmjs.com` lookup is refused.** By design: that host is not in the allowlist, so the layer returns `host www.npmjs.com is not in ALLOWED_HOSTS` and makes no request. Use `npm_package` — it fetches `registry.npmjs.org` and reports the `www.npmjs.com` URL to you.
+
+## Support development
+
+js-ts-mcp is built and maintained by Michal in his spare time. If it saves you time or makes your team's docs easier to work with, a coffee (or more) would mean a lot — every contribution helps keep the project moving. 🙏
+
+**Pay via Revolut:** [revolut.me/michal4zvc](https://revolut.me/michal4zvc)
 
 ## License & attribution
 

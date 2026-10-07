@@ -59,6 +59,11 @@ WHAT THIS MODULE GUARANTEES
   (robots unknown -> allowed) or reported as ``PoliteResponse.error``.
 * An explicit ``Disallow`` match is fail-**closed**: ``blocked_by_robots=True``.
 * The public API of the MCP tools is unaffected; the layer is an internal detail.
+* The robots **store** degrades instead of failing (P6): a cache directory that
+  cannot be created, or a database that cannot be written (read-only mount,
+  root-owned file, ``0444``), opens read-only or in-memory, cached rules keep
+  answering, and the HTTP request is still made.  A store problem never becomes
+  a tool error.
 
 A8 HARDENING (four gaps measured by A5/A6/A7 — see ``A8-layer-fixes.md``)
 ------------------------------------------------------------------------
@@ -136,9 +141,12 @@ import os
 import random
 import re
 import sqlite3
+import sys
+import tempfile
 import threading
 from collections import OrderedDict
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -175,6 +183,100 @@ LEGACY_CACHE_DIR_ENV_VARS = (
 DEFAULT_CACHE_DIR = "~/.cache/js-ts-mcp"
 ROBOTS_DB_NAME = "robots.db"
 
+#: Tried, in order, when the configured cache dir cannot be written (P6).
+#: ``<repo>/.cache`` sits next to the checkout — gitignored in all four repos,
+#: the same directory the search index already uses — and the system temp dir
+#: is the last resort that also works when ``$HOME`` is mounted read-only.
+FALLBACK_CACHE_DIR_NAME = ".cache"
+
+#: Fallbacks already announced, so a process says it once and not per call.
+_FALLBACK_LOGGED: set[str] = set()
+
+
+def _log_politeness(message: str) -> None:
+    """One line on **stderr** — stdout carries the JSON-RPC stream and stays clean."""
+    print(f"[js_ts_mcp.politeness] {message}", file=sys.stderr)
+
+
+def _read_only_url(db_path: str) -> str:
+    """SQLite URI that opens ``db_path`` strictly read-only (``mode=ro``).
+
+    ``urllib.request.pathname2url`` percent-escapes the path, so a cache
+    directory containing spaces or a literal ``%`` can neither break out of the
+    URI nor smuggle in another query parameter (``?mode=rwc``).  ``mode=ro``
+    never creates a file and never writes: SQLite refuses a write up front
+    instead of failing mid-transaction.  Same helper (and same reasoning) as
+    ``cache._read_only_url``, which fixed the document cache first.
+    """
+    return f"file:{urllib.request.pathname2url(db_path)}?mode=ro"
+
+
+def _dir_is_usable(path: str) -> bool:
+    """Can ``path`` hold a new database?  (Created if missing, then probed.)
+
+    :meth:`Politeness._open_db` used to call ``os.makedirs`` blindly, so a
+    cache directory that could not be created raised ``OSError`` on the way to
+    a tool call.  Here the same probe is an *answer* — "this cache dir is not
+    usable" — and the caller falls back to a writable one.  ``os.access`` is
+    only a hint (root bypasses the permission bits, and a mount can flip after
+    construction), which is why :meth:`Politeness._note_write_failure` is also
+    reachable from a refused write.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(path, os.W_OK)
+
+
+def _fallback_cache_dirs() -> tuple[str, ...]:
+    """Fallback cache directories, in order (see :data:`FALLBACK_CACHE_DIR_NAME`)."""
+    here = os.path.abspath(__file__)
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    return (
+        os.path.join(repo_root, FALLBACK_CACHE_DIR_NAME),
+        os.path.join(tempfile.gettempdir(), os.path.basename(repo_root)),
+    )
+
+
+def _resolve_cache_dir(base: str) -> tuple[str, str | None]:
+    """Pick the cache directory, falling back when ``base`` cannot be written.
+
+    Returns ``(directory, reason)``: ``reason`` is ``None`` when ``base`` was
+    used and explains the move otherwise.  The env var is always the *first*
+    choice — a fallback only applies when that path cannot be written.
+    """
+    base = os.path.expanduser(base)
+    if _dir_is_usable(base):
+        return base, None
+    for candidate in _fallback_cache_dirs():
+        if os.path.abspath(candidate) == os.path.abspath(base):
+            continue
+        if _dir_is_usable(candidate):
+            return candidate, f"{base!r} cannot be created or written"
+    return base, f"{base!r} cannot be created or written and no fallback dir is writable"
+
+
+def _log_cache_fallback(chosen: str, reason: str) -> None:
+    """Announce a relocated robots cache once per process (stderr, never stdout)."""
+    key = f"{reason} -> {chosen}"
+    if key in _FALLBACK_LOGGED:
+        return
+    _FALLBACK_LOGGED.add(key)
+    _log_politeness(f"robots cache fallback: {reason}; using {chosen!r}")
+
+
+def _file_write_possible(path: str) -> bool:
+    """Cheap up-front hint: can SQLite write this file **and its journal**?
+
+    The rollback journal / WAL sidecar is created *next to* the database, so a
+    directory without write permission makes even a 0644 ``robots.db``
+    unwritable.  Hint only — see :meth:`Politeness._note_write_failure`.
+    """
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        return False
+    return os.access(os.path.dirname(path) or ".", os.W_OK)
+
 #: Status codes that mean "slow down" (A2 §4.3).
 RATE_LIMIT_CODES = (429, 503, 504)
 
@@ -196,8 +298,12 @@ def default_robots_db_path() -> str:
     """Absolute path of the persistent robots.txt cache DB.
 
     ``$JS_TS_MCP_CACHE_DIR/robots.db``, defaulting to
-    ``~/.cache/js-ts-mcp/robots.db``.  Parent dirs are created lazily by
-    :meth:`Politeness._open_db`, never here.
+    ``~/.cache/js-ts-mcp/robots.db``.
+
+    P6: when that directory cannot be created or written, the path moves to a
+    writable fallback (``<repo>/.cache``, then the system temp dir) and the move
+    is announced on **stderr** — stdout is the JSON-RPC stream.  The directory
+    is created by that probe, not lazily by :meth:`Politeness._open_db`.
     """
     base = os.environ.get(CACHE_DIR_ENV_VAR)
     if not base:
@@ -206,7 +312,10 @@ def default_robots_db_path() -> str:
             if base:
                 break
     base = base or DEFAULT_CACHE_DIR
-    return os.path.join(os.path.expanduser(base), ROBOTS_DB_NAME)
+    chosen, reason = _resolve_cache_dir(base)
+    if reason:
+        _log_cache_fallback(os.path.join(chosen, ROBOTS_DB_NAME), reason)
+    return os.path.join(chosen, ROBOTS_DB_NAME)
 # response container
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -539,35 +648,175 @@ class Politeness:
             "stalls": 0,
             "budget_denied": 0,
             "errors": 0,
+            # P6: a robots-cache write the filesystem refused, and a store that
+            # could not be read at all.  Both are reported; neither is an error
+            # the caller has to survive.
+            "robots_write_failures": 0,
+            "robots_store_errors": 0,
         }
+        # P6: where the robots store really ended up, and why.  A store that
+        # cannot be written is a supported state, not a failure — see
+        # :meth:`_open_db`.
+        #: Where the robots database lives; ``None`` = the in-memory store.
+        self.cache_path: str | None = os.path.expanduser(str(cache_path)) if cache_path else None
+        #: True when the store cannot be written (reads still work).
+        self.read_only = False
+        #: Why the store went read-only, moved, or became in-memory.
+        self.read_only_reason: str | None = None
+        #: True when there is no file behind the store at all.
+        self.in_memory = cache_path is None
+        self._db: sqlite3.Connection | None = None
         self._db = self._open_db(cache_path)
 
     # ------------------------------------------------------------------ #
     # storage
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _open_db(cache_path: str | None) -> sqlite3.Connection:
-        path = cache_path or ":memory:"
-        if path != ":memory:":
-            parent = os.path.dirname(os.path.abspath(path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-        db = sqlite3.connect(path, check_same_thread=False)
+    def _open_db(self, cache_path: str | None) -> sqlite3.Connection:
+        """Open the robots store, degrading instead of raising (P6).
+
+        The store is an optimisation, not a dependency.  Three states, first
+        one that works wins:
+
+        1. **read-write file** — the normal case: the directory exists (or can
+           be created) and the database can be written.
+        2. **read-only file** (``mode=ro``) — the file is readable but nothing
+           can be written: a read-only mount, a root-owned ``robots.db``, a
+           ``0444`` file.  Cached rules keep answering; new ones are simply not
+           stored.  This is the state that used to raise
+           ``OperationalError('attempt to write a readonly database')`` out of
+           :meth:`_store_robots_row` → ``_robots_for`` → ``_get`` → ``get()``,
+           turn into ``error="politeness failure: …"`` and make the whole server
+           unusable on a host whose network was perfectly reachable.
+        3. **in-memory** — no usable directory: the configured one cannot be
+           created or written and no fallback is writable.  Politeness still
+           applies for the life of the process, it just does not survive a
+           restart.
+
+        Nothing here may raise: a store problem must never become a tool error.
+        """
+        if not cache_path:
+            self.in_memory = True
+            return self._open_schema(":memory:")
+
+        path = os.path.expanduser(str(cache_path))
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent and not _dir_is_usable(parent):
+            chosen, reason = _resolve_cache_dir(parent)
+            if chosen != parent:
+                _log_cache_fallback(os.path.join(chosen, ROBOTS_DB_NAME), reason)
+                path = os.path.join(chosen, ROBOTS_DB_NAME)
+            else:
+                _log_cache_fallback(parent, reason)
+                return self._degrade_to_memory(reason)
+        self.cache_path = path
+
+        # "cannot write" and "cannot open at all" look identical until mode=ro
+        # is tried: the first is a supported state, the second is not.
+        if not _file_write_possible(path):
+            if self._enter_read_only("the database or its directory is not writable"):
+                return self._db
+        try:
+            return self._open_schema(path)
+        except sqlite3.Error as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            if self._enter_read_only(reason):
+                return self._db
+            return self._degrade_to_memory(reason)
+
+    def _open_schema(self, path: str, *, uri: bool = False) -> sqlite3.Connection:
+        """Connect and make sure ``robots`` exists (the pre-P6 body of _open_db).
+
+        ``PRAGMA journal_mode=WAL`` is best-effort: it is refused on
+        ``:memory:`` and on a read-only file, and neither is a reason to give up
+        on the store.
+        """
+        db = sqlite3.connect(path, check_same_thread=False, uri=uri)
         try:
             db.execute("PRAGMA journal_mode=WAL")
         except sqlite3.Error:  # pragma: no cover - WAL unsupported on :memory:
             pass
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS robots ("
-            "host TEXT PRIMARY KEY, status INTEGER NOT NULL, "
-            "content TEXT NOT NULL, fetched_at REAL NOT NULL)"
-        )
-        # ``fetched_at`` is epoch seconds from the *wall* clock (A11 F5).  The
-        # schema is unchanged from pre-A11 databases on purpose: legacy rows hold
-        # a monotonic number, and :meth:`_row_is_fresh` expires them instead of
-        # trusting them, so no ALTER TABLE / migration script is needed.
-        db.commit()
+        try:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS robots ("
+                "host TEXT PRIMARY KEY, status INTEGER NOT NULL, "
+                "content TEXT NOT NULL, fetched_at REAL NOT NULL)"
+            )
+            # ``fetched_at`` is epoch seconds from the *wall* clock (A11 F5).  The
+            # schema is unchanged from pre-A11 databases on purpose: legacy rows hold
+            # a monotonic number, and :meth:`_row_is_fresh` expires them instead of
+            # trusting them, so no ALTER TABLE / migration script is needed.
+            db.commit()
+        except sqlite3.Error:
+            db.close()
+            raise
         return db
+
+    def _open_read_only(self, path: str) -> sqlite3.Connection | None:
+        """Open ``path`` through a ``mode=ro`` URI, or ``None`` if it is not a
+        readable database at all.
+
+        This probe is what tells "cannot write" (recoverable → read-only store)
+        from "nothing usable on disk" (→ in-memory store).
+        """
+        try:
+            db = sqlite3.connect(_read_only_url(path), uri=True, check_same_thread=False)
+            db.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error:
+            return None
+        return db
+
+    def _enter_read_only(self, reason: str) -> bool:
+        """Downgrade the file store to a ``mode=ro`` connection; True if it worked.
+
+        Also reachable from a *refused* write (:meth:`_note_write_failure`),
+        because ``os.access`` is only a hint.  From here on
+        :meth:`_store_robots_row` skips writes up front instead of paying for
+        the same refused write on every call.
+        """
+        self.read_only = True
+        self.read_only_reason = reason
+        conn = self._open_read_only(self.cache_path) if self.cache_path else None
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None
+        if conn is None:
+            return False
+        self._db = conn
+        return True
+
+    def _degrade_to_memory(self, reason: str) -> sqlite3.Connection:
+        """No usable file: run the store in-memory for the life of the process."""
+        self.read_only = True
+        self.read_only_reason = reason
+        self.in_memory = True
+        self.cache_path = None
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+        self._db = self._open_schema(":memory:")
+        return self._db
+
+    def _note_write_failure(self, exc: BaseException) -> None:
+        """Record a refused robots-cache write and stop trying to write.
+
+        The robots verdict that triggered the write is already computed in
+        memory, so the request continues unchanged — only persistence is lost.
+        The store is downgraded (read-only, else in-memory) so the next call
+        does not pay for the same refused write, and the counter plus one
+        stderr line make the loss visible instead of surfacing as a tool error.
+        """
+        self._n["robots_write_failures"] += 1
+        if self.read_only:
+            return
+        reason = f"{type(exc).__name__}: {exc}"
+        if not self._enter_read_only(reason):
+            self._degrade_to_memory(reason)
+        _log_politeness(f"robots cache write refused ({reason}); persistence disabled")
 
     def close(self) -> None:
         try:
@@ -650,6 +899,10 @@ class Politeness:
             return {
                 "disabled": self.disabled,
                 **{k: v for k, v in self._n.items()},
+                # P6: where the robots store is and whether it can write.
+                "robots_db": self.cache_path,
+                "read_only": self.read_only,
+                "read_only_reason": self.read_only_reason,
                 "hosts": {h: round(s.current_delay, 3) for h, s in self._hosts.items()},
                 "budgets": {k: list(v) for k, v in self._budgets.items()},
                 "cached_bodies": len(self._bodies),
@@ -672,13 +925,39 @@ class Politeness:
         return f"{scheme}://{netloc}/robots.txt"
 
     def _load_robots_row(self, host: str) -> tuple[int, str, float] | None:
-        cur = self._db.execute(
-            "SELECT status, content, fetched_at FROM robots WHERE host = ?", (host,)
-        )
-        row = cur.fetchone()
+        """The stored robots row — a miss on a read-only store is normal (P6).
+
+        A read-only database can legitimately have no ``robots`` table (the
+        ``CREATE`` could not run), and a WAL database whose sidecar is not
+        readable shows only what the main file holds.  Both are **misses**, not
+        errors: the robots.txt is fetched again and the request proceeds.  The
+        store is moved to memory so the same failure is not repeated per call.
+        """
+        try:
+            cur = self._db.execute(
+                "SELECT status, content, fetched_at FROM robots WHERE host = ?", (host,)
+            )
+            row = cur.fetchone()
+        except sqlite3.Error as exc:
+            self._n["robots_store_errors"] += 1
+            if not self.in_memory:
+                reason = f"{type(exc).__name__}: {exc}"
+                self._degrade_to_memory(reason)
+                _log_politeness(f"robots cache unreadable ({reason}); store moved to memory")
+            return None
         return (int(row[0]), row[1], float(row[2])) if row else None
 
     def _store_robots_row(self, host: str, status: int, content: str, fetched_at: float) -> None:
+        """Persist a robots verdict — **best-effort** (P6).
+
+        On a read-only filesystem the ``INSERT`` raises
+        ``sqlite3.OperationalError('attempt to write a readonly database')``.
+        Before P6 that escaped here → ``_robots_for`` → ``_get`` → ``get()`` as
+        ``error="politeness failure: attempt to write a readonly database"``,
+        which is why a read-only cache directory made these servers nearly
+        unusable.  It is now counted and the store is downgraded; the caller
+        keeps its verdict and the request it was making.
+        """
         # NOTE (crawl4ai bug #1): always write, even when content is unchanged —
         # otherwise fetched_at stays stale and robots.txt is re-fetched forever.
         #
@@ -686,11 +965,16 @@ class Politeness:
         # caller passes ``self._wall()``).  This column outlives the process and
         # often the boot, so a ``time.monotonic()`` value stored here is garbage:
         # after a reboot it reads as "the future" and the row never expires.
-        self._db.execute(
-            "INSERT OR REPLACE INTO robots (host, status, content, fetched_at) VALUES (?,?,?,?)",
-            (host, status, content, fetched_at),
-        )
-        self._db.commit()
+        if self.read_only:
+            return
+        try:
+            self._db.execute(
+                "INSERT OR REPLACE INTO robots (host, status, content, fetched_at) VALUES (?,?,?,?)",
+                (host, status, content, fetched_at),
+            )
+            self._db.commit()
+        except sqlite3.Error as exc:
+            self._note_write_failure(exc)
 
     def _ttl_for(self, status: int) -> float:
         # A transport-level failure is a *soft* negative: keep it short so a

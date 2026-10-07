@@ -547,6 +547,87 @@ def test_npm_package_requires_name(fake_cache_dir, monkeypatch):
     assert calls["npm"] == []
 
 
+def _ok_npm_with_github_readme(name: str, body: str) -> dict:
+    """What fetch_npm_package now returns when npm had no README."""
+    payload = _ok_npm(name, "4.21.0")
+    payload["readme_markdown"] = body
+    payload["readme_source"] = f"github:example/{name}@HEAD/README.md"
+    return payload
+
+
+def test_npm_package_surfaces_where_the_readme_came_from(fake_cache_dir, monkeypatch):
+    body = "# express\n\n" + "Fast, unopinionated, minimalist web framework for Node.js.\n" * 30
+    _patch_fetchers(monkeypatch, npm=lambda n, v=None: _ok_npm_with_github_readme(n, body))
+    out = server_mod.npm_package("express")
+    assert out["readme_source"] == "github:example/express@HEAD/README.md"
+    assert out["readme_markdown"].startswith("# express")
+    assert out["truncated"] is False
+
+
+def test_npm_package_caps_the_readme_and_reports_truncated(fake_cache_dir, monkeypatch):
+    body = "# big\n\n" + ("line of readme text to be cut off\n" * 4000)
+    _patch_fetchers(monkeypatch, npm=lambda n, v=None: _ok_npm_with_github_readme(n, body))
+
+    out = server_mod.npm_package("express", max_tokens=500)
+    assert out["truncated"] is True
+    assert "[truncated: showing ~" in out["readme_markdown"]
+    # ~500 estimated tokens ≈ 2 000 characters, not the ~57 000 the body has.
+    assert len(out["readme_markdown"]) < 2_500
+    assert out["readme_markdown"].startswith("# big")
+    # The cut lands on a line boundary, never mid-word.
+    lines = out["readme_markdown"].splitlines()
+    assert lines[-1].startswith("[truncated: showing ~")
+    assert lines[-2] == ""
+    assert lines[-3].endswith("cut off")
+
+
+def test_npm_package_default_cap_is_6000_tokens(fake_cache_dir, monkeypatch):
+    body = "# big\n\n" + ("line of readme text to be cut off\n" * 4000)
+    _patch_fetchers(monkeypatch, npm=lambda n, v=None: _ok_npm_with_github_readme(n, body))
+
+    out = server_mod.npm_package("express")
+    assert out["truncated"] is True
+    # 6 000 estimated tokens ≈ 24 000 characters.
+    assert 20_000 < len(out["readme_markdown"]) < 25_000
+
+
+def test_npm_package_cache_keeps_the_uncapped_readme(fake_cache_dir, monkeypatch):
+    """max_tokens belongs to the caller; the cached entry must stay complete."""
+    body = "# big\n\n" + ("line of readme text to be cut off\n" * 4000)
+    calls = _patch_fetchers(monkeypatch, npm=lambda n, v=None: _ok_npm_with_github_readme(n, body))
+
+    small = server_mod.npm_package("express", max_tokens=200)
+    assert small["truncated"] is True
+
+    # The body is ~132 000 characters ≈ 33 000 estimated tokens, so 50 000 is a
+    # cap that must fit it whole — proving the cache kept the uncapped copy.
+    big = server_mod.npm_package("express", max_tokens=50_000)
+    assert big["cached"] is True
+    assert len(calls["npm"]) == 1          # served from cache, not re-fetched
+    assert big["truncated"] is False       # the cache held the whole document
+    assert big["readme_markdown"] == body
+
+
+def test_npm_package_without_a_readme_stays_null_and_carries_the_note(
+    fake_cache_dir, monkeypatch
+):
+    """The bug this fix exists for: null must never be silent."""
+    payload = _ok_npm("express", "4.21.0")
+    payload["readme_markdown"] = None
+    payload["note"] = (
+        "npm serves no readme for this package and its repository "
+        "(https://gitlab.com/acme/express.git) is not a GitHub project URL"
+    )
+    _patch_fetchers(monkeypatch, npm=lambda n, v=None: payload)
+
+    out = server_mod.npm_package("express")
+    assert out["ok"] is True
+    assert out["readme_markdown"] is None
+    assert "not a GitHub project URL" in out["note"]
+    # Nothing to truncate → no truncation claim either way.
+    assert "truncated" not in out
+
+
 # ---------------------------------------------------------------------------
 # js_status
 # ---------------------------------------------------------------------------

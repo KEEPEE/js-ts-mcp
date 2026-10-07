@@ -24,8 +24,13 @@ Tool set:
   (estimated as ``len(text) // 4``) cut at a line boundary.
 - ``js_search(query, limit=8)`` — rank MDN + TypeScript handbook docs by
   name/path from the cached search index.
-- ``npm_package(name, version=None)`` — npm registry metadata (+ readme when
-  resolvable), optionally version-pinned, cached 1 day keyed by name+version.
+- ``npm_package(name, version=None, max_tokens=6000)`` — npm registry metadata
+  plus the README, optionally version-pinned, cached 1 day keyed by
+  name+version.  npm's packument no longer carries a usable readme (the field
+  is an empty string for modern packages), so the document is fetched from the
+  package's GitHub repository and reported in ``readme_source``; when it cannot
+  be fetched ``readme_markdown`` stays null and ``note`` explains why.  The
+  cache holds the uncapped README and ``max_tokens`` is applied on the way out.
 - ``js_status()`` — real health check over the search index, the local cache
   and light GET probes of developer.mozilla.org, typescriptlang.org and
   registry.npmjs.org.  Reports the politeness layer's counters in a top-level
@@ -311,6 +316,23 @@ def _truncate_markdown(markdown: str, max_tokens: int | None) -> tuple[str, bool
     shown = len(cut) // 4
     note = f"\n\n[truncated: showing ~{shown} of ~{total} estimated tokens]"
     return cut.rstrip() + note, True
+
+
+def _cap_readme(payload: dict, max_tokens: int) -> dict:
+    """Apply the caller's token cap to ``readme_markdown`` in *payload*.
+
+    Mutates the dict it is given (callers pass a copy or a payload they are
+    about to return) and only touches it when a README is actually present, so
+    a package without one keeps its old shape.  ``truncated`` is reported
+    whenever there was something to truncate — mirroring :func:`_doc_payload`.
+    """
+    readme = payload.get("readme_markdown")
+    if not readme:
+        return payload
+    capped, truncated = _truncate_markdown(readme, max_tokens)
+    payload["readme_markdown"] = capped
+    payload["truncated"] = truncated
+    return payload
 
 
 def _doc_payload(
@@ -650,14 +672,27 @@ def js_search(query: str, limit: int = 8) -> dict:
 
 @mcp.tool()
 @budgeted("npm_package")
-def npm_package(name: str, version: str | None = None) -> dict:
-    """Look up a package on the npm registry (metadata + readme when resolvable).
+def npm_package(name: str, version: str | None = None, max_tokens: int = 6000) -> dict:
+    """Look up a package on the npm registry (metadata + readme).
 
     Returns name, resolved version, description, license, homepage, repository
     URL, keywords, engines, dependencies and the readme as markdown. When
     ``version`` is given the lookup is pinned to that release; otherwise the
     latest version is used. Metadata is cached for 1 day keyed by name+version;
     failures are never cached.
+
+    npm no longer puts the README in the packument — for modern packages the
+    ``readme`` field is an empty string — so the document is fetched from the
+    package's GitHub repository.  When it is found, ``readme_source`` names the
+    exact file (e.g. ``github:colinhacks/zod@HEAD/packages/zod/README.md``);
+    when it is not, ``readme_markdown`` stays ``null`` and ``note`` says why.
+    Only ``github.com`` repositories are followed; gitlab/bitbucket packages
+    and repos with no repository URL get the note, not a guess.
+
+    ``max_tokens`` truncates the README to roughly that many tokens (estimated
+    as ``len(text)//4``), cut at a line boundary, and sets ``"truncated": true``
+    when applied.  The cache keeps the **full** README, so the same entry can
+    answer a later call with a larger ``max_tokens``.
 
     On failure returns {"ok": False, "error", "suggestion"}.
     """
@@ -686,7 +721,7 @@ def npm_package(name: str, version: str | None = None) -> dict:
                 if isinstance(data, dict):
                     out = dict(data)
                     out["cached"] = True
-                    return out
+                    return _cap_readme(out, max_tokens)
 
         result = fetch_npm_package(pkg, ver)
         if not result.get("ok"):
@@ -706,11 +741,15 @@ def npm_package(name: str, version: str | None = None) -> dict:
             "readme_markdown": result.get("readme_markdown"),
             "url": result.get("url"),
         }
+        if result.get("readme_source"):
+            data["readme_source"] = result["readme_source"]
         if result.get("note"):
             data["note"] = result["note"]
+        # Cache the uncapped document: the token budget belongs to this caller,
+        # not to the entry.
         _cache_set(key, data, NPM_META_TTL)
         data["cached"] = False
-        return data
+        return _cap_readme(data, max_tokens)
     except Exception as exc:
         return {
             "ok": False,

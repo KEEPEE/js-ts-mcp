@@ -4,7 +4,10 @@ Public fetch functions (each returns a dict and NEVER raises):
 
 - :func:`fetch_mdn_doc(slug)` — one MDN page as markdown.
 - :func:`fetch_ts_page(page)` — one TypeScript handbook page as markdown.
-- :func:`fetch_npm_package(name, version=None)` — npm package metadata.
+- :func:`fetch_npm_package(name, version=None)` — npm package metadata, with
+  the README filled from GitHub raw when the registry does not carry one (see
+  :func:`fetch_github_readme`).
+- :func:`fetch_github_readme(owner_repo)` — one repository README as text.
 
 Pure parser functions used by the fetchers after the HTTP layer (and unit
 tested offline against ``tests/fixtures``):
@@ -31,7 +34,7 @@ handling with ``Retry-After``, stall detection, conditional GET
 The layer never raises and never changes the return shape.  Opt out with
 ``JS_TS_MCP_POLITENESS_DISABLED=1`` — at the user's own risk.
 
-Two facts of this repo drive the settings:
+Three facts of this repo drive the settings:
 
 * ``registry.npmjs.org/robots.txt`` is a **trap** — it answers HTTP 200 with
   ``application/json``, the packument of the npm package literally named
@@ -42,6 +45,10 @@ Two facts of this repo drive the settings:
   decoded (A2 cold measurement).  Bodies above
   :data:`MAX_CACHED_BODY_BYTES` are therefore not kept in memory and not
   written to the revalidation store — the body is simply not cached.
+* ``raw.githubusercontent.com/robots.txt`` answers **HTTP 404** with the 14-byte
+  body ``404: Not Found`` (measured 2026-10-07).  No robots file means no
+  rules, so the README fallback may fetch raw files from that host — but it is
+  still allowlisted explicitly, so a new host can never be reached by accident.
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ __all__ = [
     "fetch_mdn_doc",
     "fetch_ts_page",
     "fetch_npm_package",
+    "fetch_github_readme",
     "parse_mdn_html",
     "parse_ts_html",
     "parse_npm_packument",
@@ -83,6 +91,13 @@ MDN_BASE_URL = "https://developer.mozilla.org"
 TS_BASE_URL = "https://www.typescriptlang.org"
 NPM_REGISTRY_URL = "https://registry.npmjs.org"
 NPM_PACKAGE_URL = "https://www.npmjs.com/package"
+
+#: Raw file host used only by the README fallback (see
+#: :func:`fetch_github_readme`).  ``HEAD`` is the mutable ref GitHub accepts in
+#: a raw URL, so no default-branch lookup is needed: measured 2026-10-07,
+#: ``raw.githubusercontent.com/expressjs/express/HEAD/Readme.md`` → 200,
+#: 10 371 bytes.
+GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com"
 
 #: Honest, contactable UA (A1 §6 / A2 §4.3).  This module used to send a
 #: Chrome 126 spoof: it buys nothing, it defeats ``User-agent:``-specific
@@ -106,8 +121,17 @@ TIMEOUTS = (5.0, 20.0, 60.0)
 #: ``www.npmjs.com`` is deliberately absent: it only appears inside the
 #: ``url`` field we report, never in a request (and its robots.txt is a
 #: Cloudflare 403 challenge anyway).
+#: ``raw.githubusercontent.com`` joined with the README fallback: its robots.txt
+#: is an HTTP 404 (measured 2026-10-07, body ``404: Not Found``) so the host has
+#: no rules, but it is listed explicitly anyway — a host this code fetches must
+#: appear here, otherwise the layer refuses it and the fallback silently fails.
 ALLOWED_HOSTS = frozenset(
-    {"developer.mozilla.org", "www.typescriptlang.org", "registry.npmjs.org"}
+    {
+        "developer.mozilla.org",
+        "www.typescriptlang.org",
+        "registry.npmjs.org",
+        "raw.githubusercontent.com",
+    }
 )
 
 #: Hard cap on requests one MCP tool call may make (A2 §4.3).  Since A8 F3 a
@@ -115,10 +139,15 @@ ALLOWED_HOSTS = frozenset(
 #: pays too.  Measured live (A10 smoke): cold ``js_docs("Promise")`` = MDN
 #: robots + sitemap + TS robots + handbook page + the MDN page itself = **5**
 #: units (the index rebuild is what makes this call expensive); cold
-#: ``js_docs("ts:intro")`` = robots + page = **2**; ``npm_package(x)`` = **2**.
-#: 7 keeps the legitimate cold path (5) inside the cap with 2 units of reserve
-#: for a ``429`` retry or a redirect hop, while an unknown identifier still
-#: costs at most 2–3 requests — the cap is not what bounds the error path.
+#: ``js_docs("ts:intro")`` = robots + page = **2**.
+#: ``npm_package(x)`` with the README fallback, measured 2026-10-07: cold
+#: ``zod`` = npm robots + packument + raw-host robots + the 22-byte pointer +
+#: the document it names = **5**; the same call warm (ETag revalidation, robots
+#: cached) = **3**; a package whose README is nowhere = 2 + 1 + 6 candidates =
+#: **9**, which the cap cuts off at 7 and the caller reports as a ``note``
+#: rather than an error.  7 keeps every legitimate cold path inside the cap
+#: with reserve for a ``429`` retry or a redirect hop; the README fallback is
+#: deliberately bounded by the same cap instead of raising it.
 FETCH_BUDGET_LIMIT = 7
 
 #: Bodies up to this size are kept for conditional GET (in the layer's memory
@@ -131,6 +160,46 @@ MAX_CACHED_BODY_BYTES = 2 * 1024 * 1024
 #: TTL for the raw body + validators the fetcher keeps for conditional GET.
 #: Matches the server's docs TTL so a revalidation window always exists.
 REVALIDATION_TTL_SECONDS = 7 * 24 * 3600
+
+# ---------------------------------------------------------------------------
+# README fallback settings (npm packuments no longer carry a usable readme)
+# ---------------------------------------------------------------------------
+
+#: Candidate README paths, tried in this order.  The order is not arbitrary:
+#: ``README.md`` is the GitHub convention, ``Readme.md`` is what express
+#: actually publishes (measured: ``HEAD/README.md`` → 404, ``HEAD/Readme.md`` →
+#: 200 / 10 371 B), the case variants cover the rest of the common spellings,
+#: ``README.markdown`` and ``README.rst`` are the pre-markdown leftovers, and
+#: ``docs/README.md`` catches repos that move the document out of the root.
+README_CANDIDATES = (
+    "README.md",
+    "Readme.md",
+    "readme.md",
+    "README.markdown",
+    "README.rst",
+    "docs/README.md",
+)
+
+#: A body shorter than this is not a README worth returning — it is a stub, a
+#: redirect page (GitHub's raw 404 body is 14 bytes) or a placeholder.
+MIN_README_BYTES = 80
+
+#: A body at or below this size, made of exactly one line that looks like a
+#: relative document path, is a **pointer**: monorepos park a one-liner at the
+#: root and keep the real document in a package directory.  Measured live:
+#: ``colinhacks/zod/HEAD/README.md`` is 22 bytes whose entire content is
+#: ``packages/zod/README.md``, and the real document is 7 304 bytes at
+#: ``colinhacks/zod/HEAD/packages/zod/README.md``.
+MAX_POINTER_CHARS = 300
+
+#: How many pointer files we are willing to chase before giving up on this
+#: candidate.  Two hops is enough for every layout observed in the wild and it
+#: is the loop guard: a pointer that points at itself can never spin.
+MAX_POINTER_HOPS = 2
+
+#: Extensions a pointer may name.  Anything else (an image, a script, a URL) is
+#: not a document to follow.
+_POINTER_EXTENSIONS = ("md", "markdown", "rst")
 
 #: Stable prefixes of the layer's own error messages (``Politeness.get``);
 #: used to tell a robots block, an allowlist refusal and a spent budget apart
@@ -747,6 +816,255 @@ def fetch_ts_page(page: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GitHub README fallback
+# ---------------------------------------------------------------------------
+
+#: ``https://``, ``http://``, ``git+https://``, ``git://``, ``git+ssh://`` (with
+#: or without the ``git@`` user) and ``www.``.  ``.git`` and a trailing slash
+#: are optional.  Every shape here is a value npm really serves: measured
+#: 2026-10-07, ``zod`` → ``git+https://github.com/colinhacks/zod.git``,
+#: ``express`` → ``git+https://github.com/expressjs/express.git``,
+#: ``left-pad`` → ``git+ssh://git@github.com/stevemao/left-pad.git``.
+_GITHUB_URL_RE = re.compile(
+    r"^(?:git\+)?(?:(?:https?|git|ssh)://)(?:[^/@\s]+@)?"
+    r"(?:www\.)?github\.com[:/]"
+    r"(?P<owner>[^/?#\s]+)/(?P<repo>[^/?#\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+#: The scheme-less shorthand npm's own tooling accepts (``gh:`` is its alias).
+_GITHUB_SHORTHAND_RE = re.compile(
+    r"^(?:github|gh):(?P<owner>[^/?#\s]+)/(?P<repo>[^/?#\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def _github_owner_repo(repository_url: str | None) -> str | None:
+    """Turn a normalised npm ``repository.url`` into an ``owner/repo`` pair.
+
+    Returns ``None`` when there is nothing safe to fetch.  That is deliberate
+    for non-GitHub hosts: gitlab.com and bitbucket.org have their own raw-file
+    layouts *and* their own robots policies, and this module only ever contacts
+    hosts whose behaviour has been measured (see :data:`ALLOWED_HOSTS`).  A
+    repository URL that is not a plain GitHub project URL is therefore not
+    guessed at — the caller reports the miss in a ``note`` instead.
+    """
+    if not repository_url:
+        return None
+    url = str(repository_url).strip()
+    if not url:
+        return None
+    # npm likes to store "https://github.com/owner/repo#readme"; the fragment is
+    # not part of the path and would otherwise break the match.
+    url = url.split("#", 1)[0].split("?", 1)[0]
+    match = _GITHUB_URL_RE.match(url) or _GITHUB_SHORTHAND_RE.match(url)
+    if match is None:
+        return None
+    owner, repo = match.group("owner").strip("/"), match.group("repo").strip("/")
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}"
+
+
+def _readme_pointer_target(body: str) -> str | None:
+    """Return the relative document path when *body* is a pointer file.
+
+    A pointer is what a monorepo leaves at the repository root: one short line
+    naming the real document.  Measured live 2026-10-07 —
+    ``colinhacks/zod/HEAD/README.md`` is 22 bytes and its entire content is
+    ``packages/zod/README.md``, while the real README is 7 304 bytes at
+    ``colinhacks/zod/HEAD/packages/zod/README.md``.  Following it is the only
+    way to get a README for the most-downloaded validation package on npm.
+
+    Only a single line that is a relative path to a markdown/rst document is
+    followed.  Absolute URLs, rooted paths and any ``..`` segment are refused:
+    the fetch is scoped to ``{owner}/{repo}/HEAD/`` and that scope is not a
+    suggestion.
+    """
+    stripped = body.strip()
+    if not stripped or len(stripped) > MAX_POINTER_CHARS:
+        return None
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    target = lines[0]
+    if "://" in target or target.startswith(("/", "\\")):
+        return None
+    if any(ch.isspace() for ch in target):
+        # "see docs/README.md for details" is prose, not a path.  A pointer is
+        # the whole file, so it has nothing around the path.
+        return None
+    # "./docs/README.md" is a legitimate relative path; ".." is not.  The fetch
+    # is scoped to {owner}/{repo}/HEAD/ and that scope is not a suggestion.
+    while target.startswith("./"):
+        target = target[2:]
+    if any(segment in ("", "..") for segment in target.split("/")):
+        return None
+    if not target.lower().endswith(tuple(_POINTER_EXTENSIONS)):
+        return None
+    return target
+
+
+def _readme_is_substantive(body: str) -> bool:
+    """True when *body* is long enough to plausibly be a README."""
+    return len(body.encode("utf-8", errors="replace")) > MIN_README_BYTES
+
+
+def _fetch_readme_file(base: str, repo: str, path: str, tried: list[str]) -> dict:
+    """Fetch one candidate README, following a pointer chain if there is one.
+
+    ``base`` is always ``{GITHUB_RAW_BASE_URL}/{owner}/{repo}/HEAD``; every URL
+    this function can build stays under it.
+
+    A ``304`` counts as a hit: :func:`_get` offers the stored ETag and hands
+    back the body it already had (``from_cache=True``), which is the same
+    document.  Treating ``304`` as a miss would make the *second* call for a
+    package fail with "no README found" — measured live: the first
+    ``fetch_npm_package("zod")`` fetched the pointer, the next one revalidated
+    it.
+    """
+    current = path
+    for _hop in range(MAX_POINTER_HOPS + 1):
+        tried.append(current)
+        response = _get(f"{base}/{current}")
+        if response.budget_exhausted:
+            # Our own cap stopped this, not GitHub.  Say so, and let the caller
+            # stop trying further candidates.
+            return {
+                "ok": False,
+                "budget_exhausted": True,
+                "error": response.error or "request budget exhausted",
+            }
+        status = response.status_code
+        # 2xx is a hit.  So is a 304 that came back with the body :func:`_get`
+        # had stored — same document, nothing re-downloaded.
+        if not (200 <= (status or 0) < 300 or (status == 304 and response.content)):
+            return {"ok": False, "error": f"HTTP {status} for {current}"}
+        body = response.text
+        pointer = _readme_pointer_target(body)
+        if pointer is not None:
+            current = pointer
+            continue
+        if not _readme_is_substantive(body):
+            size = len(body.encode("utf-8", errors="replace"))
+            return {"ok": False, "error": f"{current} is only {size} bytes"}
+        result: dict = {
+            "ok": True,
+            "markdown": body,
+            "source": f"github:{repo}@HEAD/{current}",
+        }
+        if current.lower().endswith(".rst"):
+            # This repo has no RST→markdown converter (python-docs-mcp has
+            # ``_rst_to_markdown``; this one never needed one).  Returning the
+            # raw body is only honest if the caller is told what it is.
+            result["note"] = (
+                "the README is reStructuredText and this server has no "
+                "RST-to-markdown converter: readme_markdown is the raw .rst body"
+            )
+        return result
+    return {"ok": False, "error": f"pointer chain at {path} exceeded {MAX_POINTER_HOPS} hops"}
+
+
+def fetch_github_readme(owner_repo: str) -> dict:
+    """Fetch a GitHub repository's README as text.
+
+    Why this exists: npm no longer puts the README in the packument.  Measured
+    live 2026-10-07, ``registry.npmjs.org/zod`` and ``registry.npmjs.org/express``
+    both *do* have a ``readme`` key, but its value is the empty string ``""``
+    (``left-pad``, a 2016-era package, still carries 871 bytes).  A
+    single-version doc — what a version-pinned lookup fetches — has no
+    ``readme`` key at all.  So ``readme_markdown`` came back ``null`` for
+    essentially every modern package, silently.  The registry stays the metadata
+    source; only the document is taken from GitHub, where the author wrote it.
+
+    Returns ``{"ok": True, "markdown": str, "source": str}`` where ``source``
+    names the file that produced the text (e.g.
+    ``"github:colinhacks/zod@HEAD/packages/zod/README.md"``), or
+    ``{"ok": False, "error": str, "tried": [...]}``.  Never raises.
+
+    Budget: every candidate and every pointer hop is a real request and pays a
+    unit of the calling tool's budget (:data:`FETCH_BUDGET_LIMIT`).  When the
+    budget is spent the result carries ``"budget_exhausted": True`` and the
+    candidate loop stops — a spent budget degrades the README to a ``note``, it
+    never turns a working metadata lookup into an error.
+    """
+    repo = str(owner_repo or "").strip().strip("/")
+    parts = repo.split("/")
+    if len(parts) != 2 or any(p in ("", ".", "..") for p in parts):
+        return {"ok": False, "error": f"not an owner/repo pair: {owner_repo!r}", "tried": []}
+    base = f"{GITHUB_RAW_BASE_URL}/{repo}/HEAD"
+    tried: list[str] = []
+    try:
+        for candidate in README_CANDIDATES:
+            outcome = _fetch_readme_file(base, repo, candidate, tried)
+            if outcome.get("ok"):
+                return outcome
+            if outcome.get("budget_exhausted"):
+                return {
+                    "ok": False,
+                    "error": outcome["error"],
+                    "budget_exhausted": True,
+                    "tried": tried,
+                }
+        return {
+            "ok": False,
+            "error": f"no README found for {repo} (tried {', '.join(tried)})",
+            "tried": tried,
+        }
+    except Exception as exc:  # transport failure, bad URL, anything else
+        return {
+            "ok": False,
+            "error": f"README fetch failed: {type(exc).__name__}: {exc}",
+            "tried": tried,
+        }
+
+
+def _append_note(result: dict, text: str) -> None:
+    """Append to ``result["note"]`` instead of overwriting an existing one."""
+    existing = result.get("note")
+    result["note"] = f"{existing}; {text}" if existing else text
+
+
+def _no_readme_reason(repository_url: str | None) -> str:
+    """Why the fallback could not even try, in one honest sentence."""
+    if not repository_url:
+        return (
+            "npm serves no readme for this package and it declares no repository "
+            "URL, so there is nowhere to fetch one from"
+        )
+    return (
+        f"npm serves no readme for this package and its repository "
+        f"({repository_url}) is not a GitHub project URL, so no README was fetched "
+        "(only github.com raw files are requested)"
+    )
+
+
+def _attach_github_readme(result: dict) -> dict:
+    """Fill ``readme_markdown`` from GitHub when the registry carried nothing.
+
+    The contract this enforces: ``readme_markdown: null`` is never silent.  A
+    README that was fetched says where it came from (``readme_source``); a
+    README that was not fetched says why (``note``).
+    """
+    if result.get("readme_markdown"):
+        return result
+    repository_url = result.get("repository_url")
+    owner_repo = _github_owner_repo(repository_url)
+    if owner_repo is None:
+        _append_note(result, _no_readme_reason(repository_url))
+        return result
+    fetched = fetch_github_readme(owner_repo)
+    if not fetched.get("ok"):
+        _append_note(result, f"no README available for {owner_repo}: {fetched['error']}")
+        return result
+    result["readme_markdown"] = fetched["markdown"]
+    result["readme_source"] = fetched["source"]
+    if fetched.get("note"):
+        _append_note(result, fetched["note"])
+    return result
+
+
+# ---------------------------------------------------------------------------
 # npm registry
 # ---------------------------------------------------------------------------
 
@@ -891,8 +1209,9 @@ def parse_npm_packument(data: dict) -> dict:
 def _npm_latest_fallback(name: str, encoded_name: str, reason: str) -> dict:
     """Fall back to the ``/{name}/latest`` endpoint when the packument fails.
 
-    The single-version doc has no readme, so the result carries
-    ``readme_markdown=None`` plus an explanatory ``note``.
+    The single-version doc has no readme at all, so the README is taken from
+    GitHub (:func:`_attach_github_readme`) and the result still carries an
+    explanatory ``note`` about where it came from.
     """
     try:
         response = _get(f"{NPM_REGISTRY_URL}/{encoded_name}/latest")
@@ -919,21 +1238,29 @@ def _npm_latest_fallback(name: str, encoded_name: str, reason: str) -> dict:
     result["readme_markdown"] = None
     result["note"] = f"readme unavailable (packument fetch failed: {reason})"
     result["url"] = f"{NPM_PACKAGE_URL}/{name}"
-    return result
+    return _attach_github_readme(result)
 
 
 def fetch_npm_package(name: str, version: str | None = None) -> dict:
-    """Fetch npm package metadata (and readme when resolvable).
+    """Fetch npm package metadata, plus the README from GitHub when npm has none.
 
     With ``version``: uses the single-version doc ``/{name}/{version}``.
     Without: fetches the full packument; if that fails but the package exists,
-    falls back to ``/{name}/latest`` with ``readme_markdown=None`` and a
-    ``note``. Returns ``{"ok": False, "error": "package not found on npm",
-    "suggestion": ...}`` for unknown packages — never raises.
+    falls back to ``/{name}/latest`` with a ``note``. Returns
+    ``{"ok": False, "error": "package not found on npm", "suggestion": ...}``
+    for unknown packages — never raises.
+
+    README: when the registry's ``readme`` is missing or empty (the normal case
+    since npm stopped embedding readmes — see :func:`fetch_github_readme`), the
+    document is fetched from ``raw.githubusercontent.com`` and the result gains
+    ``readme_source``.  When that cannot be done the result keeps
+    ``readme_markdown=None`` **and** says why in ``note`` — a silent null is the
+    bug this path exists to fix.
 
     The politeness layer caps how many requests one call may make, so the
     fallback is only taken for an HTTP/parse failure of the packument — never
-    for a robots block or a spent budget.
+    for a robots block or a spent budget.  The README fallback shares the same
+    budget and stops at the cap instead of failing the lookup.
     """
     try:
         name = (name or "").strip()
@@ -964,6 +1291,9 @@ def fetch_npm_package(name: str, version: str | None = None) -> dict:
                 return _fail(f"failed to fetch npm package: invalid JSON ({exc})")
             if result.get("ok"):
                 result["url"] = f"{NPM_PACKAGE_URL}/{name}/{version}"
+                # A single-version doc never carries a readme, so this is the
+                # normal path for a version-pinned lookup.
+                result = _attach_github_readme(result)
             return result
 
         # No version given: full packument. It is the largest artifact this
@@ -1002,6 +1332,6 @@ def fetch_npm_package(name: str, version: str | None = None) -> dict:
             fallback = _npm_latest_fallback(name, encoded_name, result["error"])
             return fallback if fallback.get("ok") else result
         result["url"] = f"{NPM_PACKAGE_URL}/{name}"
-        return result
+        return _attach_github_readme(result)
     except Exception as exc:
         return _fail(f"failed to fetch npm package: {exc}")

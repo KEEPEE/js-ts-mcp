@@ -346,6 +346,351 @@ def test_trap_is_cached_so_robots_is_fetched_once_per_ttl(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 6. npm README fallback: the packument has no readme, GitHub raw does
+# ---------------------------------------------------------------------------
+#
+# Measured live 2026-10-07 against the real services:
+#   registry.npmjs.org/zod            → "readme": ""            (key present, empty)
+#   registry.npmjs.org/express        → "readme": ""
+#   registry.npmjs.org/zod/4.6.5      → no "readme" key at all
+#   raw.githubusercontent.com/robots.txt → HTTP 404, body "404: Not Found" (14 B)
+#   colinhacks/zod/HEAD/README.md     → HTTP 200, 22 B, content "packages/zod/README.md"
+#   colinhacks/zod/HEAD/packages/zod/README.md → HTTP 200, 7 304 B
+#   expressjs/express/HEAD/README.md  → HTTP 404
+#   expressjs/express/HEAD/Readme.md  → HTTP 200, 10 371 B
+
+#: What raw.githubusercontent.com really answers for its robots file: nothing.
+RAW_ROBOTS_404 = httpx.Response(404, content=b"404: Not Found")
+
+#: zod's root README is a 22-byte pointer; the real document is ~7.3 KB.
+ZOD_POINTER = b"packages/zod/README.md"
+ZOD_README = b'<p align="center">\nzod\n</p>\n' + b"zod body line\n" * 500
+
+#: express publishes the capitalised "Readme.md", not "README.md".
+EXPRESS_README = b'<a href="https://expressjs.com/">\n' + b"express body\n" * 800
+
+
+def _packument_with_empty_readme(name: str, repository_url: str) -> bytes:
+    """The packument shape npm serves today: ``readme`` present but empty."""
+    return json.dumps(
+        {
+            "name": name,
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {"name": name, "version": "1.0.0", "dependencies": {}}},
+            "repository": {"type": "git", "url": repository_url},
+            "readme": "",
+        }
+    ).encode("utf-8")
+
+
+def _npm_routes(name: str, repository_url: str) -> dict:
+    """Registry routes for a package whose packument carries no readme."""
+    return {
+        "/robots.txt": NPM_ROBOTS_TRAP,
+        f"/{name}": _packument_with_empty_readme(name, repository_url),
+    }
+
+
+def test_readme_fallback_follows_the_monorepo_pointer(monkeypatch):
+    """zod: the root README is a pointer, and following it is the only way in."""
+    fast_layer(FakeClock())
+    rec = use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                **_npm_routes("zod", "git+https://github.com/colinhacks/zod.git"),
+                "/colinhacks/zod/HEAD/README.md": ZOD_POINTER,
+                "/colinhacks/zod/HEAD/packages/zod/README.md": ZOD_README,
+            }
+        ),
+    )
+    with tool_budget("npm_package"):
+        out = fetchers_mod.fetch_npm_package("zod")
+
+    assert out["ok"] is True
+    assert out["readme_markdown"].startswith('<p align="center">')
+    assert out["readme_source"] == "github:colinhacks/zod@HEAD/packages/zod/README.md"
+    assert "note" not in out
+    assert rec.hits("/colinhacks/zod/HEAD/README.md") == 1
+    assert rec.hits("/colinhacks/zod/HEAD/packages/zod/README.md") == 1
+    # The pointer won: no further candidate was tried after the hit.
+    assert rec.hits("/colinhacks/zod/HEAD/Readme.md") == 0
+    # Two hosts, so two cold robots fetches: npm and the raw host.
+    assert rec.robots_hits() == 2
+    # robots(npm) + packument + robots(raw) + pointer + target = 5 of 7 units.
+    assert len(rec.requests) == 5
+
+
+def test_readme_fallback_finds_the_capitalised_readme(monkeypatch):
+    """express: HEAD/README.md is 404, HEAD/Readme.md is the real document."""
+    fast_layer(FakeClock())
+    rec = use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                **_npm_routes("express", "git+https://github.com/expressjs/express.git"),
+                "/expressjs/express/HEAD/README.md": 404,
+                "/expressjs/express/HEAD/Readme.md": EXPRESS_README,
+            }
+        ),
+    )
+    with tool_budget("npm_package"):
+        out = fetchers_mod.fetch_npm_package("express")
+
+    assert out["ok"] is True
+    assert out["readme_source"] == "github:expressjs/express@HEAD/Readme.md"
+    assert len(out["readme_markdown"]) > 5_000
+    assert rec.hits("/expressjs/express/HEAD/README.md") == 1
+    assert rec.hits("/expressjs/express/HEAD/Readme.md") == 1
+    # Stopping at the first hit is the point: the rest is never requested.
+    assert rec.hits("/expressjs/express/HEAD/readme.md") == 0
+    assert len(rec.requests) == 5
+
+
+def test_null_readme_is_never_silent(monkeypatch):
+    """A package whose repo is not on GitHub: null README *plus* the reason."""
+    fast_layer(FakeClock())
+    rec = use_transport(
+        monkeypatch,
+        Recorder(_npm_routes("internal-thing", "https://gitlab.com/acme/internal-thing.git")),
+    )
+    with tool_budget("npm_package"):
+        out = fetchers_mod.fetch_npm_package("internal-thing")
+
+    assert out["ok"] is True
+    assert out["readme_markdown"] is None
+    assert "note" in out
+    assert "gitlab.com" in out["note"]
+    # Nothing left the allowlisted hosts: no raw host was even contacted.
+    assert {r.url.host for r in rec.requests} == {"registry.npmjs.org"}
+
+
+def test_package_without_a_repository_url_says_so(monkeypatch):
+    fast_layer(FakeClock())
+    body = json.dumps(
+        {
+            "name": "orphan",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {"name": "orphan", "version": "1.0.0"}},
+            "readme": "",
+        }
+    ).encode("utf-8")
+    use_transport(monkeypatch, Recorder({"/robots.txt": NPM_ROBOTS_TRAP, "/orphan": body}))
+    with tool_budget("npm_package"):
+        out = fetchers_mod.fetch_npm_package("orphan")
+
+    assert out["ok"] is True
+    assert out["readme_markdown"] is None
+    assert "no repository URL" in out["note"]
+
+
+def test_all_candidates_404_reports_every_one_of_them(monkeypatch):
+    """With room in the budget, the whole candidate list is tried and named."""
+    fast_layer(FakeClock())
+    routes = _npm_routes("bare", "git+https://github.com/acme/bare.git")
+    for candidate in fetchers_mod.README_CANDIDATES:
+        routes[f"/acme/bare/HEAD/{candidate}"] = 404
+    rec = use_transport(monkeypatch, Recorder(routes))
+
+    with tool_budget("npm_package", limit=12):
+        out = fetchers_mod.fetch_npm_package("bare")
+
+    assert out["ok"] is True
+    assert out["readme_markdown"] is None
+    for candidate in fetchers_mod.README_CANDIDATES:
+        assert candidate in out["note"]
+        assert rec.hits(f"/acme/bare/HEAD/{candidate}") == 1
+
+
+def _revalidating(body: bytes, etag: str):
+    """Serve *body* once, then ``304`` whenever the client offers the ETag back."""
+
+    def handler(request, rec):
+        if request.headers.get("if-none-match") == etag:
+            return httpx.Response(304, headers={"etag": etag})
+        return httpx.Response(200, content=body, headers={"etag": etag})
+
+    return handler
+
+
+def test_readme_revalidation_304_is_still_the_readme(monkeypatch):
+    """A warm second call must not degrade to "no README found".
+
+    Found live, not invented: the first ``fetch_npm_package("zod")`` fetched the
+    pointer and the target with fresh ETags; the next one revalidated both and
+    got ``304``.  ``_Response`` is deliberately truthful about that (304 +
+    ``from_cache``), so a caller that only accepts ``200`` would report a
+    missing README for a package it just read.
+    """
+    fast_layer(FakeClock())
+    use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                **_npm_routes("zod", "git+https://github.com/colinhacks/zod.git"),
+                "/colinhacks/zod/HEAD/README.md": _revalidating(ZOD_POINTER, '"ptr1"'),
+                "/colinhacks/zod/HEAD/packages/zod/README.md": _revalidating(ZOD_README, '"doc1"'),
+            }
+        ),
+    )
+
+    for call in range(2):
+        with tool_budget("npm_package"):
+            out = fetchers_mod.fetch_npm_package("zod")
+        assert out["ok"] is True, call
+        assert out["readme_source"] == "github:colinhacks/zod@HEAD/packages/zod/README.md", call
+        assert out["readme_markdown"].startswith('<p align="center">'), call
+
+
+def test_spent_budget_degrades_the_readme_to_a_note_not_an_error(monkeypatch):
+    """A12 rule: our own cap may cost the README, never the whole lookup."""
+    fast_layer(FakeClock())
+    rec = use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                **_npm_routes("zod", "git+https://github.com/colinhacks/zod.git"),
+                "/colinhacks/zod/HEAD/README.md": ZOD_POINTER,
+                "/colinhacks/zod/HEAD/packages/zod/README.md": ZOD_README,
+            }
+        ),
+    )
+    # 3 units: npm robots + packument + raw-host robots.  The first README
+    # candidate is the one that gets refused.
+    with tool_budget("npm_package", limit=3):
+        out = fetchers_mod.fetch_npm_package("zod")
+
+    assert out["ok"] is True
+    assert out["name"] == "zod"
+    assert out["readme_markdown"] is None
+    assert "budget" in out["note"]
+    assert len(rec.requests) == 3
+    assert rec.hits("/colinhacks/zod/HEAD/README.md") == 0
+
+
+def test_pointer_cannot_walk_outside_the_repository(monkeypatch):
+    """A pointer is resolved under {owner}/{repo}/HEAD/ and nowhere else."""
+    fast_layer(FakeClock())
+    routes = _npm_routes("tricky", "git+https://github.com/acme/tricky.git")
+    routes["/acme/tricky/HEAD/README.md"] = b"../../secrets/README.md"
+    routes["/secrets/README.md"] = b"you should not be reading this document at all"
+    for candidate in fetchers_mod.README_CANDIDATES[1:]:
+        routes[f"/acme/tricky/HEAD/{candidate}"] = 404
+    rec = use_transport(monkeypatch, Recorder(routes))
+
+    with tool_budget("npm_package", limit=12):
+        out = fetchers_mod.fetch_npm_package("tricky")
+
+    assert out["ok"] is True
+    assert out["readme_markdown"] is None
+    raw_paths = [
+        r.url.path
+        for r in rec.requests
+        if r.url.host == "raw.githubusercontent.com" and r.url.path != "/robots.txt"
+    ]
+    assert raw_paths, "the fallback should still have tried the candidates"
+    assert all(path.startswith("/acme/tricky/HEAD/") for path in raw_paths)
+    assert rec.hits("/secrets/README.md") == 0
+
+
+def test_rst_readme_is_returned_raw_and_says_so(monkeypatch):
+    """This repo has no RST→markdown converter, so the note is mandatory."""
+    fast_layer(FakeClock())
+    rst = b"tricky\n=====\n\nA reStructuredText README with enough body text.\n" * 6
+    routes = _npm_routes("tricky", "git+https://github.com/acme/tricky.git")
+    for candidate in fetchers_mod.README_CANDIDATES:
+        routes[f"/acme/tricky/HEAD/{candidate}"] = 404
+    routes["/acme/tricky/HEAD/README.rst"] = rst
+    use_transport(monkeypatch, Recorder(routes))
+
+    with tool_budget("npm_package", limit=12):
+        out = fetchers_mod.fetch_npm_package("tricky")
+
+    assert out["ok"] is True
+    assert out["readme_source"] == "github:acme/tricky@HEAD/README.rst"
+    assert out["readme_markdown"].startswith("tricky\n=====")
+    assert "reStructuredText" in out["note"]
+
+
+def test_version_pinned_lookup_gets_the_readme_too(monkeypatch):
+    """``/{name}/{version}`` has no readme key at all — the fallback covers it."""
+    fast_layer(FakeClock())
+    version_doc = json.dumps(
+        {
+            "name": "zod",
+            "version": "4.6.5",
+            "license": "MIT",
+            "repository": {"type": "git", "url": "git+https://github.com/colinhacks/zod.git"},
+        }
+    ).encode("utf-8")
+    use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                "/robots.txt": NPM_ROBOTS_TRAP,
+                "/zod/4.6.5": version_doc,
+                "/colinhacks/zod/HEAD/README.md": ZOD_POINTER,
+                "/colinhacks/zod/HEAD/packages/zod/README.md": ZOD_README,
+            }
+        ),
+    )
+    with tool_budget("npm_package"):
+        out = fetchers_mod.fetch_npm_package("zod", "4.6.5")
+
+    assert out["ok"] is True
+    assert out["version"] == "4.6.5"
+    assert out["readme_source"] == "github:colinhacks/zod@HEAD/packages/zod/README.md"
+
+
+def test_registry_readme_still_wins_and_no_raw_request_is_made(monkeypatch):
+    """left-pad-style packages still ship a readme: do not go looking elsewhere."""
+    fast_layer(FakeClock())
+    body = json.dumps(
+        {
+            "name": "left-pad",
+            "dist-tags": {"latest": "1.3.0"},
+            "versions": {"1.3.0": {"name": "left-pad", "version": "1.3.0"}},
+            "repository": {"type": "git", "url": "git+ssh://git@github.com/stevemao/left-pad.git"},
+            "readme": "## left-pad\n\nString left pad\n" + "body\n" * 40,
+        }
+    ).encode("utf-8")
+    rec = use_transport(monkeypatch, Recorder({"/robots.txt": NPM_ROBOTS_TRAP, "/left-pad": body}))
+
+    with tool_budget("npm_package"):
+        out = fetchers_mod.fetch_npm_package("left-pad")
+
+    assert out["ok"] is True
+    assert out["readme_markdown"].startswith("## left-pad")
+    assert "readme_source" not in out
+    assert "note" not in out
+    assert {r.url.host for r in rec.requests} == {"registry.npmjs.org"}
+
+
+def test_raw_host_robots_404_is_negatively_cached(monkeypatch):
+    """No robots file on the raw host: store that fact, do not re-fetch it."""
+    clock = FakeClock()
+    layer = fast_layer(clock)
+    rec = use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                **_npm_routes("zod", "git+https://github.com/colinhacks/zod.git"),
+                "/robots.txt": RAW_ROBOTS_404,
+                "/colinhacks/zod/HEAD/README.md": ZOD_POINTER,
+                "/colinhacks/zod/HEAD/packages/zod/README.md": ZOD_README,
+            }
+        ),
+    )
+    for _ in range(2):
+        with tool_budget("npm_package"):
+            assert fetchers_mod.fetch_npm_package("zod")["ok"] is True
+
+    # One robots fetch per host per TTL, not one per call.
+    assert rec.robots_hits() == 2
+    assert layer.stats()["robots_negative"] >= 1
+
+
+# ---------------------------------------------------------------------------
 # 3. www.npmjs.com: Cloudflare 403 → negative cache, and never requested anyway
 # ---------------------------------------------------------------------------
 def test_www_npmjs_com_403_robots_is_negatively_cached(monkeypatch):
@@ -373,9 +718,22 @@ def test_www_npmjs_com_is_not_in_the_allowlist(monkeypatch):
     assert rec.requests == []
 
 
-def test_allowlist_covers_exactly_the_three_fetched_hosts():
+def test_allowlist_covers_exactly_the_four_fetched_hosts():
+    """Four hosts, four reasons — and nothing else is reachable.
+
+    ``raw.githubusercontent.com`` joined when ``npm_package`` started fetching
+    the README the registry no longer ships.  Its robots.txt is an HTTP 404
+    (measured 2026-10-07, body ``404: Not Found``), i.e. no rules, but it still
+    has to be listed: an unlisted host is refused by the layer, so a missing
+    entry would turn the README fallback into a silent no-op.
+    """
     assert ALLOWED_HOSTS == frozenset(
-        {"developer.mozilla.org", "www.typescriptlang.org", "registry.npmjs.org"}
+        {
+            "developer.mozilla.org",
+            "www.typescriptlang.org",
+            "registry.npmjs.org",
+            "raw.githubusercontent.com",
+        }
     )
 
 
