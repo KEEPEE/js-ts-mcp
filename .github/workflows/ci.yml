@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${ github.workflow }-${ github.ref }
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (py${ matrix.python-version })
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${ matrix.python-version }
+      - name: Install package and test dependencies
+        run: uv pip install --system -e . pytest
+      # The suite is fully offline: every HTTP call goes through httpx.MockTransport,
+      # so CI never touches the documentation sites and results are deterministic.
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: build and import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and sdist
+        run: uv build
+      - name: Install the wheel and import the server
+        run: |
+          uv pip install --system dist/*.whl
+          python -c "import js_ts_mcp; print('js-ts-docs', js_ts_mcp.__version__)"

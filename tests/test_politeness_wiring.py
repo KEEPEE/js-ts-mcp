@@ -379,6 +379,41 @@ def test_allowlist_covers_exactly_the_three_fetched_hosts():
     )
 
 
+def test_honest_user_agent_is_what_reaches_the_wire(monkeypatch):
+    """No browser spoofing: the public product UA is on *every* request.
+
+    A robots file can only match a product token it can see, so the UA is part
+    of the politeness contract rather than cosmetics — asserted on the wire,
+    not in prose.  It must also be contactable (a public repository URL) and
+    must not masquerade as a browser.
+    """
+    fast_layer(FakeClock(), allowed_hosts=ALLOWED_HOSTS)
+    html = (FIXTURES / "mdn_array.html").read_bytes()
+    rec = use_transport(
+        monkeypatch,
+        Recorder(
+            {
+                "/robots.txt": MDN_ROBOTS.encode(),
+                "/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array": html,
+            }
+        ),
+    )
+    assert fetchers_mod.fetch_mdn_doc(
+        "Web/JavaScript/Reference/Global_Objects/Array"
+    )["ok"] is True
+    assert rec.requests, "no request reached the wire"
+    assert {r.headers["user-agent"] for r in rec.requests} == {fetchers_mod.USER_AGENT}
+
+    ua = fetchers_mod.USER_AGENT
+    assert ua.startswith("js-ts-mcp/")
+    assert "github.com/KEEPEE/js-ts-mcp" in ua
+    for spoof in ("Mozilla/", "Chrome/", "Safari/", "AppleWebKit"):
+        assert spoof not in ua
+    # the robots fetch itself carries it — a robots file matches on this token
+    robots_request = next(r for r in rec.requests if r.url.path == "/robots.txt")
+    assert robots_request.headers["user-agent"] == ua
+
+
 # ---------------------------------------------------------------------------
 # 4. MDN sitemap revalidation + typescriptlang robots 404 negative cache
 # ---------------------------------------------------------------------------

@@ -428,7 +428,7 @@ class _HostState:
 class Politeness:
     """robots.txt + throttle + Retry-After + conditional GET + request budget.
 
-    >>> p = Politeness("python-docs-mcp/0.1 (+https://github.com/KEEPEE/…)")
+    >>> p = Politeness("docs-mcp/0.1 (+https://example.com/docs-mcp)")
     >>> p.can_fetch("https://pypi.org/pypi/dio/json")          # robots-disallowed
     False
     >>> r = p.get(client, "https://docs.python.org/3/library/json.html",

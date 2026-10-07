@@ -89,7 +89,7 @@ NPM_PACKAGE_URL = "https://www.npmjs.com/package"
 #: robots rules (a robots file can only match a token it can see) and it hides
 #: who is knocking.
 USER_AGENT = (
-    "js-ts-mcp/0.1 (+https://github.com/KEEPEE/js-ts-mcp)"
+    "js-ts-mcp/0.2 (+https://github.com/KEEPEE/js-ts-mcp)"
 )
 
 #: connect 5 s / read 20 s / write+pool 60 s.  The module used to carry three
