@@ -6,3 +6,7 @@ __pycache__/
 dist/
 build/
 .cache/
+
+# Local caches that must never be committed (A13 B4)
+cache.db
+robots.db

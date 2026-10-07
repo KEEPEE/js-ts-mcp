@@ -1,0 +1,67 @@
+js-ts-mcp — NOTICE
+==================
+
+Copyright (c) 2026 the js-ts-mcp authors.
+This project is licensed under the MIT license (see ``pyproject.toml``).
+
+The *design* of ``src/js_ts_mcp/politeness.py`` was inspired by
+Crawl4AI.  The implementation is our own, written from scratch (clean-room).
+
+Crawl4AI
+--------
+Copyright (c) Unclecode
+https://github.com/unclecode/crawl4ai
+Licensed under the Apache License, Version 2.0.
+
+What was taken is an idea and a problem breakdown, not a body of code:
+
+* a TTL-cached robots.txt store;
+* a wildcard path-pattern translation for robots rules, and preservation of a
+  bare ``?`` in such a rule;
+* the shape of a per-domain rate limiter with escalating backoff;
+* the split of those concerns into one small, dependency-light module.
+
+Where those ideas live in the Crawl4AI tree — a reading pointer to the design,
+**not** the source of any code here (these ranges were not copied):
+``crawl4ai/utils.py:282-419`` (``RobotsParser``), ``crawl4ai/utils.py:54-82``,
+``crawl4ai/utils.py:260-279`` (``_preserve_bare_query``) and
+``crawl4ai/async_dispatcher.py:28-85`` (``RateLimiter``).
+
+``politeness.py`` is a clean-room rewrite in this project's own synchronous,
+stdlib-plus-httpx style.  No line of it was transcribed, translated or
+mechanically adapted from a Crawl4AI source line.  Measured against
+``crawl4ai/utils.py`` and ``crawl4ai/cache_validator.py``: the longest
+contiguous span of code shared with Crawl4AI is **37 characters** — a plain
+stdlib idiom (``PRAGMA journal_mode=WAL``, ``except Exception: return False``) —
+and the longest run of identical source lines is **two trivial lines**.  The
+shared code is negligible; what is attributed here is the design, which
+copyright does not cover.  Under Apache-2.0 §4(b) this is also the notice that
+the underlying design was modified: three defects of the original are fixed.
+
+1. ``fetched_at`` is refreshed on every robots re-fetch, even when the body is
+   byte-identical (the original skipped the write, so after the TTL expired it
+   re-downloaded ``robots.txt`` on every call);
+2. negative results (404 / 403 / 5xx / unparseable body) are cached;
+3. ``Crawl-delay`` is parsed and honoured (the original never read it).
+
+The rewrite also implements RFC 9309 matching (``*``, trailing ``$``, ``%2A`` /
+``%24`` literals, merged user-agent groups, most-specific-match wins, Allow
+beats Disallow on a tie) instead of ``urllib.robotparser``, which on Python
+< 3.14 silently ignores wildcards. That matters in this package: MDN's
+robots.txt disallows ``/*/files/`` and ``/api/``, and ``robotparser`` on
+Python 3.12 reads ``*`` as a literal character, so it reports those URLs as
+allowed. The matcher in ``politeness.py`` blocks them.
+
+This repository's own trap is documented in the "npm robots.txt" section of
+``README.md``: ``https://registry.npmjs.org/robots.txt`` answers HTTP 200 with
+``application/json`` — the packument of an npm package named ``robots.txt`` —
+not a robots policy. The parser yields zero rules from it and the request
+proceeds; that behaviour is asserted against the real captured body in
+``tests/test_politeness_wiring.py``.
+
+The GPL-3.0 part of Crawl4AI — the vendored ``crawl4ai/html2text/`` fork — was
+**deliberately excluded**: no code, no data and no dependency from that tree is
+used, shipped or installed by this package, and none ever should be.  This
+module never converts HTML to markdown; that stays the caller's job
+(``markdownify``).  Crawl4AI is **not** a dependency of this package; nothing
+here imports it.

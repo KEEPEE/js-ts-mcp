@@ -28,7 +28,9 @@ Tool set:
   resolvable), optionally version-pinned, cached 1 day keyed by name+version.
 - ``js_status()`` — real health check over the search index, the local cache
   and light GET probes of developer.mozilla.org, typescriptlang.org and
-  registry.npmjs.org.
+  registry.npmjs.org.  Reports the politeness layer's counters in a top-level
+  ``politeness`` block — deliberately outside ``checks``, so it can never turn
+  ``overall`` to ``degraded`` on its own.
 
 Design rules (hard requirements):
 
@@ -38,15 +40,24 @@ Design rules (hard requirements):
 - Every tool returns a plain dict. On ANY failure the result is
   ``{"ok": False, "error": "<short message>", "suggestion": "<what to try
   instead>"}``; no exception ever escapes a tool and nothing recurses.
+- Every network path is politeness-gated (see :mod:`js_ts_mcp.politeness`)
+  and every tool binds one request budget with
+  :func:`js_ts_mcp.fetchers.tool_budget`, so one tool call cannot make an
+  unbounded number of requests (index build included).
 - Fetched content is cached in :class:`~js_ts_mcp.cache.DocCache`:
   docs TTL 7 days (key ``doc:{source}:{path}``), npm metadata TTL 1 day
-  (key ``npm:{name}[:{version}]``). Failures are never cached.
+  (key ``npm:{name}[:{version}]``). Failures are never cached. Cache writes
+  go through ``DocCache.set_value`` so they never clear the fetcher's
+  conditional-GET columns.
 """
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
+import sqlite3
 import urllib.parse
 
 import httpx
@@ -55,14 +66,19 @@ from mcp.server.fastmcp import FastMCP
 from . import __version__
 from .cache import DocCache
 from .fetchers import (
+    FETCH_BUDGET_LIMIT,
+    MAX_CACHED_BODY_BYTES,
     MDN_BASE_URL,
     NPM_REGISTRY_URL,
     TS_BASE_URL,
-    USER_AGENT,
+    current_budget,
     fetch_mdn_doc,
     fetch_npm_package,
     fetch_ts_page,
+    get_politeness,
+    tool_budget,
 )
+from .politeness import default_robots_db_path
 from .search import get_index, search_docs
 
 mcp = FastMCP("js-ts")
@@ -81,6 +97,19 @@ _ENDPOINT_PROBES = (
     ("typescriptlang_org", f"{TS_BASE_URL}/docs/handbook/intro.html"),
     ("npm_registry", f"{NPM_REGISTRY_URL}/left-pad/latest"),
 )
+
+#: Request budget one ``js_status`` call may spend.  Since A8 F3 a probe on a
+#: host whose robots.txt is not cached costs **two** units (robots.txt + the
+#: probe), and the call also rebuilds the search index when it is stale.
+#: Measured live (A10 smoke, cold cache): index rebuild 4 (MDN robots +
+#: sitemap + TS robots + handbook page) + probes 4 (MDN page 1 + TS page 1 +
+#: npm robots 1 + npm page 1 — the rebuild already cached the robots facts of
+#: the first two hosts) = **8 units**; warm = **3**.  The limit is 12 so a
+#: probe can never come back as ``error: request budget exhausted`` — that
+#: would make ``overall`` "degraded" for a purely internal reason (A7 §4.5
+#: warning), and the 4 units of reserve cover a ``429`` retry or a redirect
+#: hop on top of the cold path.
+STATUS_BUDGET_LIMIT = 12
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
@@ -118,12 +147,17 @@ def _cache_get(key: str) -> dict | None:
 
 
 def _cache_set(key: str, value: dict, ttl_seconds: int) -> None:
-    """Store a doc dict under ``key``; cache-write failures are ignored."""
+    """Store a doc dict under ``key``; cache-write failures are ignored.
+
+    ``set_value`` (not ``set``) so a row that also carries the fetcher's
+    conditional-GET columns (``etag`` / ``last_modified`` / ``body`` for the
+    same URL) keeps them — clearing them would silently disable revalidation.
+    """
     cache = _cache()
     if cache is None:
         return
     try:
-        cache.set(key, json.dumps(value), ttl_seconds)
+        cache.set_value(key, json.dumps(value), ttl_seconds)
     except Exception:
         pass
 
@@ -325,33 +359,136 @@ def _error_from(fetch_result: dict, context: str) -> dict:
 
 
 def _probe_endpoint(url: str) -> dict:
-    """Light GET probe (quick httpx, then a short curl fallback); never raises.
+    """Light GET probe through the politeness layer; never raises.
 
-    The curl fallback matters for hosts whose edge intermittently stalls
-    Python TLS clients while serving curl fine — the same behaviour
-    fetchers._get works around.
+    The previous version made a bare ``httpx`` call and then a ``curl``
+    subprocess fallback.  The curl path bypassed robots.txt, throttle, retry
+    and budget entirely, and a health check that hammers a site is not a fix
+    for politeness — it is the hole in it.  It is gone: one request per probe,
+    through the same layer as every other request.
+
+    The probe spends the *tool call's* request budget when one is bound, so
+    ``js_status`` cannot quietly add requests on top of the budget the tool
+    already has.
     """
     try:
-        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
-            resp = client.get(url, headers={"User-Agent": USER_AGENT})
-        if resp.status_code < 400:
-            return {"status": "ok", "http_status": resp.status_code}
-    except Exception:
-        pass
-    try:
-        import subprocess
-
-        proc = subprocess.run(
-            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-             "-L", "--max-time", "10", url],
-            capture_output=True, text=True, timeout=20,
-        )
-        code = int(proc.stdout.strip() or 0)
-        if code:
-            return {"status": "ok" if code < 400 else "error", "http_status": code}
+        budget_kwargs: dict = {}
+        bound = current_budget()
+        if bound is not None:
+            budget_kwargs = {"budget_scope": bound[0], "budget_limit": bound[1]}
+        with httpx.Client(
+            timeout=httpx.Timeout(8.0, connect=5.0), follow_redirects=True
+        ) as client:
+            response = get_politeness().get(client, url, **budget_kwargs)
     except Exception as exc:
-        return {"status": "error", "http_status": None, "error": f"{type(exc).__name__}: {exc}"}
-    return {"status": "error", "http_status": None, "error": "no response from httpx or curl"}
+        return {
+            "status": "error",
+            "http_status": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if response.error:
+        return {
+            "status": "error",
+            "http_status": response.status_code,
+            "error": response.error,
+        }
+    if response.status_code is not None and response.status_code < 400:
+        return {"status": "ok", "http_status": response.status_code}
+    return {
+        "status": "error",
+        "http_status": response.status_code,
+        "error": f"HTTP {response.status_code}",
+    }
+
+
+def _robots_rows() -> int | None:
+    """How many robots.txt records the politeness SQLite cache holds (read-only).
+
+    ``None`` when the robots DB does not exist yet (or the layer is running on
+    its in-memory fallback — politeness still applies, it just forgets across
+    restarts); that is not an error.
+    """
+    path = default_robots_db_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM robots").fetchone()[0])
+    except Exception:
+        return None
+
+
+def _politeness_report() -> dict:
+    """The politeness layer's counters, for ``js_status``.
+
+    Deliberately NOT one of the ``checks``: the layer's own state must never
+    flip ``overall`` to ``degraded``/``error``.  A failure here degrades to a
+    one-line error, never an exception.
+    """
+    try:
+        stats = get_politeness().stats()
+        return {
+            "status": "ok",
+            "disabled": bool(stats.get("disabled", False)),
+            "requests": int(stats.get("requests", 0)),
+            # A8 F3: ``requests`` counts content requests only; the robots
+            # attempts are the other half of what went on the wire.  F1 gives
+            # the robots waits their own counters, F2 the redirect hops, F4 the
+            # challenge detections (this repo supplies no detector, so those
+            # two stay 0 — they are reported so a future one is visible).
+            "robots_requests": int(stats.get("robots_requests", 0)),
+            "robots_rows": _robots_rows(),
+            "robots_fetches": int(stats.get("robots_fetches", 0)),
+            "robots_cache_hits": int(stats.get("robots_cache_hits", 0)),
+            "robots_negative": int(stats.get("robots_negative", 0)),
+            "robots_refreshed_unchanged": int(stats.get("robots_refreshed_unchanged", 0)),
+            "blocked_by_robots": int(stats.get("blocked_by_robots", 0)),
+            "throttle_waits": int(stats.get("throttle_waits", 0)),
+            "throttle_sleep_s": round(float(stats.get("throttle_sleep_s", 0.0)), 3),
+            "robots_throttle_waits": int(stats.get("robots_throttle_waits", 0)),
+            "robots_throttle_sleep_s": round(
+                float(stats.get("robots_throttle_sleep_s", 0.0)), 3
+            ),
+            "redirect_hops": int(stats.get("redirect_hops", 0)),
+            "challenge_detected": int(stats.get("challenge_detected", 0)),
+            "challenge_retries": int(stats.get("challenge_retries", 0)),
+            "host_delays": stats.get("hosts", {}),
+            "budgets": stats.get("budgets", {}),
+            "budget_denied": int(stats.get("budget_denied", 0)),
+            "conditional": int(stats.get("conditional", 0)),
+            "conditional_skipped": int(stats.get("conditional_skipped", 0)),
+            "revalidated_304": int(stats.get("revalidated_304", 0)),
+            "retries_429": int(stats.get("retries_429", 0)),
+            "retry_after_honoured": int(stats.get("retry_after_honoured", 0)),
+            "retries_transport": int(stats.get("retries_transport", 0)),
+            "stalls": int(stats.get("stalls", 0)),
+            # js-ts-mcp specifics: the in-memory body store and the robots DB
+            # location, because this repo pulls multi-megabyte artifacts
+            # (MDN sitemap ~1.9 MB decoded, npm packuments up to ~7 MB).
+            "cached_bodies": int(stats.get("cached_bodies", 0)),
+            "max_cached_bytes": MAX_CACHED_BODY_BYTES,
+            "robots_db": default_robots_db_path(),
+        }
+    except Exception as exc:
+        return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
+
+
+def budgeted(name: str, limit: int = FETCH_BUDGET_LIMIT):
+    """Bind one request budget to a whole tool call.
+
+    Applied *under* ``@mcp.tool()``; ``functools.wraps`` keeps the tool's
+    signature, annotations and docstring, which is what FastMCP advertises.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with tool_budget(name, limit):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +502,7 @@ def health_check() -> dict:
 
 
 @mcp.tool()
+@budgeted("js_docs")
 def js_docs(identifier: str, topic: str | None = None, max_tokens: int = 8000) -> dict:
     """Fetch an MDN Web Docs or TypeScript handbook page as markdown.
 
@@ -475,6 +613,7 @@ def _js_docs_impl(identifier: str, topic: str | None, max_tokens: int) -> dict:
 
 
 @mcp.tool()
+@budgeted("js_search")
 def js_search(query: str, limit: int = 8) -> dict:
     """Search MDN Web Docs and the TypeScript handbook by name/path.
 
@@ -510,6 +649,7 @@ def js_search(query: str, limit: int = 8) -> dict:
 
 
 @mcp.tool()
+@budgeted("npm_package")
 def npm_package(name: str, version: str | None = None) -> dict:
     """Look up a package on the npm registry (metadata + readme when resolvable).
 
@@ -580,14 +720,19 @@ def npm_package(name: str, version: str | None = None) -> dict:
 
 
 @mcp.tool()
+@budgeted("js_status", limit=STATUS_BUDGET_LIMIT)
 def js_status() -> dict:
     """Real health check: search index, local cache and upstream endpoints.
 
     Probes developer.mozilla.org, typescriptlang.org and registry.npmjs.org
-    with a light GET (8s timeout each, curl fallback). Never raises; returns
-    {"server", "version", "checks": {...}, "overall": "ok"|"degraded"|"error"}
-    where overall is "error" when the search index is unavailable, "degraded"
-    when any check fails, and "ok" otherwise.
+    with a light GET (8s timeout each, through the politeness layer — no curl
+    subprocess). Never raises; returns
+    {"server", "version", "checks": {...}, "politeness": {...}, "overall":
+    "ok"|"degraded"|"error"} where overall is "error" when the search index is
+    unavailable, "degraded" when any check fails, and "ok" otherwise.  The
+    "politeness" block holds the layer's counters (robots cache state,
+    throttle delays, budget use, conditional-GET hits) and is not a check: it
+    never changes "overall".
     """
     try:
         checks: dict = {}
@@ -634,6 +779,9 @@ def js_status() -> dict:
             "server": "js-ts-mcp",
             "version": __version__,
             "checks": checks,
+            # Outside "checks" on purpose: the layer's own counters are
+            # diagnostic and must never flip "overall".
+            "politeness": _politeness_report(),
             "overall": overall,
         }
     except Exception as exc:
