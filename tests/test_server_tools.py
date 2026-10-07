@@ -8,10 +8,12 @@ SQLite file via JS_TS_MCP_CACHE_DIR=tmp_path.
 from __future__ import annotations
 
 import re
+import sqlite3
 
 import pytest
 
 from js_ts_mcp import server as server_mod
+from js_ts_mcp.cache import DocCache
 
 
 MDN_BASE = "https://developer.mozilla.org/en-US/docs"
@@ -601,3 +603,26 @@ def test_js_status_error_when_index_broken(fake_cache_dir, monkeypatch):
     assert result["overall"] == "error"
     assert result["checks"]["search_index"]["status"] == "error"
     assert result["checks"]["search_index"]["error"] == "boom"
+
+
+def test_js_status_reports_read_only_cache_without_changing_overall(fake_cache_dir, monkeypatch):
+    """P5: an unwritable cache is *announced* — and stays an "ok" check.
+
+    The migration is forced to fail the way it does on a machine where the
+    cache file cannot be written, so this is deterministic for root too.
+    """
+    _patch_index(monkeypatch, FAKE_INDEX)
+    monkeypatch.setattr(
+        server_mod, "_probe_endpoint", lambda url: {"status": "ok", "http_status": 200}
+    )
+
+    def refusing_migration(cls, conn):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(DocCache, "_ensure_schema", classmethod(refusing_migration))
+    result = server_mod.js_status()
+    cache_check = result["checks"]["cache"]
+    assert cache_check["status"] == "ok", cache_check
+    assert cache_check["read_only"] is True
+    assert "readonly" in cache_check["read_only_reason"]
+    assert result["overall"] == "ok"
